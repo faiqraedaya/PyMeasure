@@ -1,47 +1,16 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-
-# Virtual environment
-venv/
-env/
-ENV/
 .venv/
-.env/
-
-# Distribution / packaging
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 build/
 dist/
 *.egg-info/
-*.spec
-*.bat
-
-# Logs and databases
-*.log
-*.sqlite3
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE/editor folders
-.vscode/
-.idea/
-*.sublime-workspace
-*.sublime-project
-
-# Test coverage reports
-htmlcov/
 .coverage
-.tox/
-
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# Personal settings
-*.env
-
-# AI
-.claude/
+htmlcov/
+*.spec
+.idea/
+.vscode/
+*.log

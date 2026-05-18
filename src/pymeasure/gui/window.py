@@ -2,7 +2,7 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import Qt, QPointF, Slot
+from PySide6.QtCore import Qt, QPointF, QSettings, Slot
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox,
@@ -46,6 +46,17 @@ class MainWindow(QMainWindow):
 
         self._set_tool(Tool.PAN)
         self._syncing_selection = False
+        self._last_open_dir = ""
+
+        settings = QSettings("PyMeasure", "PyMeasure")
+        self._recent_files: list[str] = settings.value("recentFiles", [])
+        if isinstance(self._recent_files, str):
+            self._recent_files = [self._recent_files]
+        self._recent_sessions: list[str] = settings.value("recentSessions", [])
+        if isinstance(self._recent_sessions, str):
+            self._recent_sessions = [self._recent_sessions]
+        self._update_recent_menu()
+        self._update_recent_session_menu()
 
     # ------------------------------------------------------------------
     # Menus
@@ -57,9 +68,11 @@ class MainWindow(QMainWindow):
         # File
         file_menu = mb.addMenu("&File")
         self._add_action(file_menu, "&Open…",         "Ctrl+O",        self.open_file)
+        self._recent_menu = file_menu.addMenu("Open &Recent")
         file_menu.addSeparator()
         self._add_action(file_menu, "&Save Session…", "Ctrl+S",        self.save_session)
         self._add_action(file_menu, "&Load Session…", "Ctrl+Shift+O",  self.load_session)
+        self._recent_session_menu = file_menu.addMenu("Load &Recent Session")
         file_menu.addSeparator()
         self._add_action(file_menu, "&Export…",       "Ctrl+E",        self.show_export)
         file_menu.addSeparator()
@@ -105,6 +118,84 @@ class MainWindow(QMainWindow):
             act.setShortcut(QKeySequence(shortcut))
         act.triggered.connect(slot)
         menu.addAction(act)
+
+    def _update_recent_menu(self):
+        self._recent_menu.clear()
+        for path in self._recent_files:
+            act = QAction(path, self)
+            act.triggered.connect(lambda checked, p=path: self._open_recent(p))
+            self._recent_menu.addAction(act)
+        self._recent_menu.setEnabled(bool(self._recent_files))
+
+    def _open_recent(self, path: str):
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Open Recent", f"File not found:\n{path}")
+            self._recent_files = [p for p in self._recent_files if p != path]
+            self._save_recents()
+            self._update_recent_menu()
+            return
+        self._load_path(path)
+
+    def _load_path(self, path: str):
+        if self.viewer.load_file(path):
+            self._last_open_dir = os.path.dirname(path)
+            self.setWindowTitle(f"PyMeasure — {os.path.basename(path)}")
+            self._update_pdf_nav()
+            if path in self._recent_files:
+                self._recent_files.remove(path)
+            self._recent_files.insert(0, path)
+            self._recent_files = self._recent_files[:10]
+            self._save_recents()
+            self._update_recent_menu()
+        else:
+            QMessageBox.warning(self, "Open File", f"Could not open:\n{path}")
+
+    def _save_recents(self):
+        QSettings("PyMeasure", "PyMeasure").setValue("recentFiles", self._recent_files)
+
+    def _update_recent_session_menu(self):
+        self._recent_session_menu.clear()
+        for path in self._recent_sessions:
+            act = QAction(path, self)
+            act.triggered.connect(lambda checked, p=path: self._open_recent_session(p))
+            self._recent_session_menu.addAction(act)
+        self._recent_session_menu.setEnabled(bool(self._recent_sessions))
+
+    def _open_recent_session(self, path: str):
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Load Recent Session", f"File not found:\n{path}")
+            self._recent_sessions = [p for p in self._recent_sessions if p != path]
+            self._save_recent_sessions()
+            self._update_recent_session_menu()
+            return
+        self._do_load_session(path)
+
+    def _do_load_session(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.viewer.load_session(data)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            QMessageBox.critical(self, "Load Session", f"Could not load session:\n{e}")
+            return
+        self._rebuild_objects_list()
+        si = self.viewer.scale_info
+        self.left_panel.scale_lbl.setText(f"1 px = {si.scale_factor:.6g} {si.unit}")
+        o  = self.viewer.origin
+        ox, oy = self.viewer._origin_world
+        self.left_panel.origin_lbl.setText(
+            f"Origin: img ({o.x:.1f}, {o.y:.1f})\n  world ({ox:.4g}, {oy:.4g})"
+        )
+        self._status_msg.setText(f"Session loaded from {path}")
+        if path in self._recent_sessions:
+            self._recent_sessions.remove(path)
+        self._recent_sessions.insert(0, path)
+        self._recent_sessions = self._recent_sessions[:10]
+        self._save_recent_sessions()
+        self._update_recent_session_menu()
+
+    def _save_recent_sessions(self):
+        QSettings("PyMeasure", "PyMeasure").setValue("recentSessions", self._recent_sessions)
 
     # ------------------------------------------------------------------
     # Status bar
@@ -236,9 +327,18 @@ class MainWindow(QMainWindow):
         idx = self.right_panel.objects_list.row(item)
         menu = QMenu(self)
         menu.addAction("Edit…", lambda: self.viewer.open_edit_dialog_for(idx))
+        menu.addAction("Copy Coordinates", lambda: self._copy_coordinates(idx))
         menu.addSeparator()
         menu.addAction("Delete", lambda: self._delete_single(idx))
         menu.exec(self.right_panel.objects_list.mapToGlobal(pos))
+
+    def _copy_coordinates(self, idx: int):
+        obj = self.viewer.objects[idx]
+        lines = ["x\ty"] + [
+            "{:.6g}\t{:.6g}".format(*self.viewer.img_to_world(QPointF(x, y)))
+            for x, y in obj.points
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
 
     def _delete_single(self, idx: int):
         reply = QMessageBox.question(
@@ -289,7 +389,7 @@ class MainWindow(QMainWindow):
             return
         reply = QMessageBox.question(
             self, "Delete Objects",
-            f"Delete {n} selected object{'s' if n > 1 else ''}?",
+            f"Delete {n} selected object{'s' if n > 1 else ''}?\nThis can be undone with Ctrl+Z.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
         )
         if reply == QMessageBox.StandardButton.Yes:
@@ -325,16 +425,11 @@ class MainWindow(QMainWindow):
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Image or PDF", "",
+            self, "Open Image or PDF", self._last_open_dir,
             "Images & PDF (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.pdf);;All Files (*)",
         )
-        if not path:
-            return
-        if self.viewer.load_file(path):
-            self.setWindowTitle(f"PyMeasure — {os.path.basename(path)}")
-            self._update_pdf_nav()
-        else:
-            QMessageBox.warning(self, "Open File", f"Could not open:\n{path}")
+        if path:
+            self._load_path(path)
 
     def _update_pdf_nav(self):
         count = self.viewer.pdf_page_count
@@ -356,27 +451,18 @@ class MainWindow(QMainWindow):
             self._status_msg.setText(f"Session saved to {path}")
         except OSError as e:
             QMessageBox.critical(self, "Save Session", f"Could not save session:\n{e}")
+            return
+        if path in self._recent_sessions:
+            self._recent_sessions.remove(path)
+        self._recent_sessions.insert(0, path)
+        self._recent_sessions = self._recent_sessions[:10]
+        self._save_recent_sessions()
+        self._update_recent_session_menu()
 
     def load_session(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load Session", "", "JSON Files (*.json)")
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.viewer.load_session(data)
-        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            QMessageBox.critical(self, "Load Session", f"Could not load session:\n{e}")
-            return
-        self._rebuild_objects_list()
-        si = self.viewer.scale_info
-        self.left_panel.scale_lbl.setText(f"1 px = {si.scale_factor:.6g} {si.unit}")
-        o  = self.viewer.origin
-        ox, oy = self.viewer._origin_world
-        self.left_panel.origin_lbl.setText(
-            f"Origin: img ({o.x:.1f}, {o.y:.1f})\n  world ({ox:.4g}, {oy:.4g})"
-        )
-        self._status_msg.setText(f"Session loaded from {path}")
+        if path:
+            self._do_load_session(path)
 
     # ------------------------------------------------------------------
     # Export / About

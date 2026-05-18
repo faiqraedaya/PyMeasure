@@ -1,7 +1,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from ..core.constants import Tool, TOOL_LABELS, TOOL_SHORTCUTS

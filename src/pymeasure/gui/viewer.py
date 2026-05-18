@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF,
 )
-from PySide6.QtWidgets import QDialog, QMenu, QMessageBox, QSizePolicy, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QSizePolicy, QWidget
 
 from ..core.constants import Tool
 from .dialogs import (
@@ -697,6 +697,9 @@ class ImageViewer(QWidget):
             self._finish_zoom_rect(QPointF(event.position()))
 
     def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.fit_to_window()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         tool = self.current_tool
@@ -1030,6 +1033,7 @@ class ImageViewer(QWidget):
 
         if len(sel) == 1:
             menu.addAction("Edit…", lambda: self._open_edit_dialog(sel[0]))
+            menu.addAction("Copy Coordinates", lambda: self._copy_coordinates(sel[0]))
             menu.addSeparator()
 
         cut_a   = menu.addAction("Cut",   self.cut_selection)
@@ -1043,7 +1047,23 @@ class ImageViewer(QWidget):
             menu.addSeparator()
             menu.addAction("Delete", self.delete_requested.emit)
 
+        img_pt = self._screen_to_img(screen_pos)
+        wx, wy = self.img_to_world(img_pt)
+        menu.addSeparator()
+        menu.addAction(
+            f"Copy Cursor Coordinates  ({wx:.6g}, {wy:.6g})",
+            lambda: QApplication.clipboard().setText(f"{wx:.6g}\t{wy:.6g}"),
+        )
+
         menu.exec(self.mapToGlobal(screen_pos.toPoint()))
+
+    def _copy_coordinates(self, idx: int):
+        obj = self.objects[idx]
+        lines = ["x\ty"] + [
+            "{:.6g}\t{:.6g}".format(*self.img_to_world(QPointF(x, y)))
+            for x, y in obj.points
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Vertex operations (delete / insert)
