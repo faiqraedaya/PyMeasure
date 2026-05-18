@@ -23,7 +23,7 @@ labelled objects, and measure distances, angles, areas, and polyline lengths.
 
 ```bash
 git clone <repo-url>
-cd 2602P_PyMeasure
+cd PyMeasure
 uv pip install -r requirements.txt   # or: pip install -r requirements.txt
 ```
 
