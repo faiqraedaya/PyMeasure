@@ -78,18 +78,29 @@ class ScaleCoordsDialog(QDialog):
         return coords, self.unit_edit.text().strip() or "px"
 
 
-class PointLabelDialog(QDialog):
-    def __init__(self, default: str = "", parent=None):
+_KIND_DISPLAY = {
+    "point":    "Point",
+    "distance": "Line",
+    "angle":    "Angle",
+    "area":     "Area",
+    "polyline": "Polyline",
+}
+
+
+class NameDialog(QDialog):
+    def __init__(self, kind: str = "point", default: str = "", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Label Point")
+        display = _KIND_DISPLAY.get(kind, kind.capitalize())
+        self.setWindowTitle(f"Label {display}")
         self.edit = QLineEdit(default)
+        self.edit.selectAll()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Point label:"))
+        layout.addWidget(QLabel(f"{display} label:"))
         layout.addWidget(self.edit)
         layout.addWidget(buttons)
         self.setLayout(layout)

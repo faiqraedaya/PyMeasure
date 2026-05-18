@@ -2,4 +2,12 @@
 name = "2602p-pymeasure"
 version = "0.1.0"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pymupdf>=1.27.2.3",
+    "pyside6>=6.11.1",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
+]

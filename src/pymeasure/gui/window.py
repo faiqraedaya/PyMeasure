@@ -47,6 +47,7 @@ class MainWindow(QMainWindow):
         self._set_tool(Tool.PAN)
         self._syncing_selection = False
         self._last_open_dir = ""
+        self._current_session_path: str | None = None
 
         settings = QSettings("PyMeasure", "PyMeasure")
         self._recent_files: list[str] = settings.value("recentFiles", [])
@@ -70,8 +71,9 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "&Open…",         "Ctrl+O",        self.open_file)
         self._recent_menu = file_menu.addMenu("Open &Recent")
         file_menu.addSeparator()
-        self._add_action(file_menu, "&Save Session…", "Ctrl+S",        self.save_session)
-        self._add_action(file_menu, "&Load Session…", "Ctrl+Shift+O",  self.load_session)
+        self._add_action(file_menu, "&Save Session",     "Ctrl+S",       self.save_session)
+        self._add_action(file_menu, "Save Session &As…", "Ctrl+Shift+S", self.save_session_as)
+        self._add_action(file_menu, "&Load Session…",    "Ctrl+Shift+O", self.load_session)
         self._recent_session_menu = file_menu.addMenu("Load &Recent Session")
         file_menu.addSeparator()
         self._add_action(file_menu, "&Export…",       "Ctrl+E",        self.show_export)
@@ -186,6 +188,7 @@ class MainWindow(QMainWindow):
         self.left_panel.origin_lbl.setText(
             f"Origin: img ({o.x:.1f}, {o.y:.1f})\n  world ({ox:.4g}, {oy:.4g})"
         )
+        self._current_session_path = path
         self._status_msg.setText(f"Session loaded from {path}")
         if path in self._recent_sessions:
             self._recent_sessions.remove(path)
@@ -442,16 +445,27 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def save_session(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Session", "", "JSON Files (*.json)")
+        if self._current_session_path and os.path.exists(self._current_session_path):
+            self._do_save_session(self._current_session_path)
+        else:
+            self.save_session_as()
+
+    def save_session_as(self):
+        start_dir = self._current_session_path or ""
+        path, _ = QFileDialog.getSaveFileName(self, "Save Session As", start_dir, "JSON Files (*.json)")
         if not path:
             return
+        self._do_save_session(path)
+
+    def _do_save_session(self, path: str):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.viewer.session_data(), f, indent=2)
-            self._status_msg.setText(f"Session saved to {path}")
         except OSError as e:
             QMessageBox.critical(self, "Save Session", f"Could not save session:\n{e}")
             return
+        self._current_session_path = path
+        self._status_msg.setText(f"Session saved to {path}")
         if path in self._recent_sessions:
             self._recent_sessions.remove(path)
         self._recent_sessions.insert(0, path)

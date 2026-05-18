@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QSizePo
 
 from ..core.constants import Tool
 from .dialogs import (
-    EditObjectDialog, PointLabelDialog, ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog,
+    EditObjectDialog, NameDialog, ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog,
 )
 from ..core.models import DiagramObject, Point, ScaleInfo
 
@@ -26,7 +26,9 @@ _KIND_COLOR = {
     "area":     QColor("#ff6699"),
     "polyline": QColor("#44ddaa"),
 }
-_SEL_COLOR = QColor("#00ddff")
+_SEL_COLOR   = QColor("#00ddff")
+_LABEL_COLOR = QColor("#dd0000")
+_PREVIEW_COLOR = QColor("#dd0000")
 
 
 # ---------------------------------------------------------------------------
@@ -377,10 +379,10 @@ class ImageViewer(QWidget):
         painter.drawEllipse(sp, 5.0, 5.0)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         label = obj.name or f"P{idx + 1}"
-        painter.setPen(QColor("white"))
+        painter.setPen(_LABEL_COLOR)
         painter.drawText(QPointF(sp.x() + 9, sp.y() - 7), label)
         wx, wy = self.img_to_world(QPointF(*obj.points[0]))
-        painter.setPen(QColor("#aaaaaa"))
+        painter.setPen(_LABEL_COLOR)
         painter.drawText(QPointF(sp.x() + 9, sp.y() + 6), f"({wx:.2f}, {wy:.2f})")
 
     def _paint_distance(self, painter, obj, color, selected):
@@ -394,8 +396,9 @@ class ImageViewer(QWidget):
         painter.setPen(QPen(color, 2))
         painter.drawLine(sp0, sp1)
         mid = QPointF((sp0.x() + sp1.x()) / 2, (sp0.y() + sp1.y()) / 2)
-        painter.setPen(QColor("white"))
-        painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), obj.display_short())
+        painter.setPen(_LABEL_COLOR)
+        label = obj.name or "Line"
+        painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), f"{label}: {obj.display_short()}")
 
     def _paint_angle(self, painter, obj, color, selected):
         if len(obj.points) < 3:
@@ -408,8 +411,9 @@ class ImageViewer(QWidget):
         painter.setPen(QPen(color, 2))
         painter.drawLine(sp[0], sp[1])
         painter.drawLine(sp[2], sp[1])
-        painter.setPen(QColor("white"))
-        painter.drawText(QPointF(sp[1].x() + 5, sp[1].y() - 5), obj.display_short())
+        painter.setPen(_LABEL_COLOR)
+        label = obj.name or "Angle"
+        painter.drawText(QPointF(sp[1].x() + 5, sp[1].y() - 5), f"{label}: {obj.display_short()}")
 
     def _paint_area(self, painter, obj, color, selected):
         if len(obj.points) < 3:
@@ -427,8 +431,9 @@ class ImageViewer(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         cx = sum(s.x() for s in sps) / len(sps)
         cy = sum(s.y() for s in sps) / len(sps)
-        painter.setPen(QColor("white"))
-        painter.drawText(QPointF(cx + 5, cy), obj.display_short())
+        painter.setPen(_LABEL_COLOR)
+        label = obj.name or "Area"
+        painter.drawText(QPointF(cx + 5, cy), f"{label}: {obj.display_short()}")
 
     def _paint_polyline(self, painter, obj, color, selected):
         if len(obj.points) < 2:
@@ -442,8 +447,9 @@ class ImageViewer(QWidget):
         for i in range(len(sps) - 1):
             painter.drawLine(sps[i], sps[i + 1])
         mid = sps[len(sps) // 2]
-        painter.setPen(QColor("white"))
-        painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), obj.display_short())
+        painter.setPen(_LABEL_COLOR)
+        label = obj.name or "Polyline"
+        painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), f"{label}: {obj.display_short()}")
 
     def _paint_vertex_handles(self, painter: QPainter, points: list):
         painter.setPen(QPen(QColor("#00ff88"), 1))
@@ -469,7 +475,7 @@ class ImageViewer(QWidget):
 
         if tool == Tool.ADD_LINE:
             if len(pts_screen) == 1 and preview:
-                painter.setPen(QPen(QColor("#ffdd00"), 1, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(_PREVIEW_COLOR, 1, Qt.PenStyle.DashLine))
                 painter.drawLine(pts_screen[0], preview)
 
         elif tool == Tool.ADD_ANGLE:
@@ -502,13 +508,12 @@ class ImageViewer(QWidget):
                 painter.drawText(QPointF(sp.x() + 7, sp.y() - 4), str(i + 1))
 
         elif tool == Tool.ADD_POLYLINE:
-            all_pts = pts_screen + ([preview] if preview else [])
             painter.setPen(QPen(QColor("#44ddaa"), 2))
-            for i in range(len(all_pts) - 1):
-                painter.drawLine(all_pts[i], all_pts[i + 1])
+            for i in range(len(pts_screen) - 1):
+                painter.drawLine(pts_screen[i], pts_screen[i + 1])
             if preview and pts_screen:
-                painter.setPen(QPen(QColor("#44ddaa"), 1, Qt.PenStyle.DashLine))
-                # Already drawn above; last segment is the preview dash
+                painter.setPen(QPen(_PREVIEW_COLOR, 1, Qt.PenStyle.DashLine))
+                painter.drawLine(pts_screen[-1], preview)
             painter.setPen(QColor("white"))
             for i, sp in enumerate(pts_screen):
                 painter.drawText(QPointF(sp.x() + 7, sp.y() - 4), str(i + 1))
@@ -912,17 +917,17 @@ class ImageViewer(QWidget):
             self.update()
 
         elif tool == Tool.ADD_POINT:
-            default_label = f"P{len(self.objects) + 1}"
-            dlg = PointLabelDialog(default_label, self)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                self._push_undo()
-                obj = DiagramObject(
-                    kind="point", name=dlg.label(),
-                    points=[[img_pt.x, img_pt.y]],
-                )
-                self.objects.append(obj)
-                self.objects_changed.emit()
-                self.update()
+            name = self._ask_object_name("point")
+            if name is None:
+                return
+            self._push_undo()
+            obj = DiagramObject(
+                kind="point", name=name,
+                points=[[img_pt.x, img_pt.y]],
+            )
+            self.objects.append(obj)
+            self.objects_changed.emit()
+            self.update()
 
         elif tool == Tool.ADD_LINE:
             self._temp.append(img_pt)
@@ -1337,10 +1342,29 @@ class ImageViewer(QWidget):
         self._temp.clear()
         self.update()
 
+    def _default_object_name(self, kind: str) -> str:
+        prefix = {
+            "point": "P", "distance": "L", "angle": "A",
+            "area": "Area", "polyline": "PL",
+        }.get(kind, kind.capitalize())
+        count = sum(1 for o in self.objects if o.kind == kind) + 1
+        return f"{prefix}{count}"
+
+    def _ask_object_name(self, kind: str) -> Optional[str]:
+        dlg = NameDialog(kind, self._default_object_name(kind), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._temp.clear()
+            self.update()
+            return None
+        return dlg.label()
+
     def _finish_distance(self):
+        name = self._ask_object_name("distance")
+        if name is None:
+            return
         p0, p1 = self._temp[0], self._temp[1]
         obj = DiagramObject(
-            kind="distance",
+            kind="distance", name=name,
             points=[[p0.x, p0.y], [p1.x, p1.y]],
             unit=self.scale_info.unit,
         )
@@ -1352,8 +1376,11 @@ class ImageViewer(QWidget):
         self.update()
 
     def _finish_angle(self):
+        name = self._ask_object_name("angle")
+        if name is None:
+            return
         obj = DiagramObject(
-            kind="angle",
+            kind="angle", name=name,
             points=[[p.x, p.y] for p in self._temp],
             unit="°",
         )
@@ -1365,8 +1392,11 @@ class ImageViewer(QWidget):
         self.update()
 
     def _finish_area(self):
+        name = self._ask_object_name("area")
+        if name is None:
+            return
         obj = DiagramObject(
-            kind="area",
+            kind="area", name=name,
             points=[[p.x, p.y] for p in self._temp],
             unit=self.scale_info.unit,
         )
@@ -1378,8 +1408,11 @@ class ImageViewer(QWidget):
         self.update()
 
     def _finish_polyline(self):
+        name = self._ask_object_name("polyline")
+        if name is None:
+            return
         obj = DiagramObject(
-            kind="polyline",
+            kind="polyline", name=name,
             points=[[p.x, p.y] for p in self._temp],
             unit=self.scale_info.unit,
         )
