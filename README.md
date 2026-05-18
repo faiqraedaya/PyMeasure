@@ -107,16 +107,3 @@ requirements.txt
 pyproject.toml
 uv.lock
 ```
-
-## Development
-
-```bash
-git clone <repo-url>
-cd 2602P_PyMeasure
-uv pip install -r requirements.txt
-python main.py
-```
-
-No test suite or lint configuration is currently present in the repository.
-
-<!-- UNVERIFIED: no LICENSE file found in the repository root. -->
