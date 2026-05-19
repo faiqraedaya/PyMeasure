@@ -6,7 +6,7 @@ from PySide6.QtCore import Qt, QPointF, QSettings, Slot
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QSizePolicy, QSplitter,
+    QProgressDialog, QSizePolicy, QSplitter,
 )
 
 from ..core.constants import Tool, TOOL_HELP, TOOL_LABELS, TOOL_SHORTCUTS
@@ -47,7 +47,6 @@ class MainWindow(QMainWindow):
         self._set_tool(Tool.PAN)
         self._syncing_selection = False
         self._last_open_dir = ""
-        self._current_session_path: str | None = None
 
         settings = QSettings("PyMeasure", "PyMeasure")
         self._recent_files: list[str] = settings.value("recentFiles", [])
@@ -56,8 +55,21 @@ class MainWindow(QMainWindow):
         self._recent_sessions: list[str] = settings.value("recentSessions", [])
         if isinstance(self._recent_sessions, str):
             self._recent_sessions = [self._recent_sessions]
+
+        # Map: image/pdf file path -> last-attached session path
+        raw_map = settings.value("fileSessionMap", "")
+        try:
+            self._file_session_map: dict[str, str] = (
+                json.loads(raw_map) if raw_map else {}
+            )
+            if not isinstance(self._file_session_map, dict):
+                self._file_session_map = {}
+        except (json.JSONDecodeError, TypeError):
+            self._file_session_map = {}
+
         self._update_recent_menu()
         self._update_recent_session_menu()
+        self._refresh_ui_for_active_tab()
 
     # ------------------------------------------------------------------
     # Menus
@@ -101,6 +113,13 @@ class MainWindow(QMainWindow):
                          lambda: self.viewer.set_zoom(self.viewer.zoom * 1.25))
         self._add_action(view_menu, "Zoom &Out",      "Ctrl+-",
                          lambda: self.viewer.set_zoom(self.viewer.zoom / 1.25))
+        view_menu.addSeparator()
+        self._show_objects_act = QAction("Show All &Objects", self)
+        self._show_objects_act.setCheckable(True)
+        self._show_objects_act.setChecked(True)
+        self._show_objects_act.setShortcut(QKeySequence("Ctrl+H"))
+        self._show_objects_act.toggled.connect(self.viewer.set_objects_visible)
+        view_menu.addAction(self._show_objects_act)
 
         # Tools
         tools_menu = mb.addMenu("&Tools")
@@ -118,7 +137,7 @@ class MainWindow(QMainWindow):
         act = QAction(label, self)
         if shortcut:
             act.setShortcut(QKeySequence(shortcut))
-        act.triggered.connect(slot)
+        act.triggered.connect(lambda checked=False, s=slot: s())
         menu.addAction(act)
 
     def _update_recent_menu(self):
@@ -139,18 +158,45 @@ class MainWindow(QMainWindow):
         self._load_path(path)
 
     def _load_path(self, path: str):
-        if self.viewer.load_file(path):
-            self._last_open_dir = os.path.dirname(path)
-            self.setWindowTitle(f"PyMeasure — {os.path.basename(path)}")
-            self._update_pdf_nav()
-            if path in self._recent_files:
-                self._recent_files.remove(path)
-            self._recent_files.insert(0, path)
-            self._recent_files = self._recent_files[:10]
-            self._save_recents()
-            self._update_recent_menu()
-        else:
+        """Open `path` as a brand-new tab in the viewer."""
+        idx = self.viewer.open_in_new_tab(path)
+        if idx < 0:
             QMessageBox.warning(self, "Open File", f"Could not open:\n{path}")
+            return
+
+        self._last_open_dir = os.path.dirname(path)
+        if path in self._recent_files:
+            self._recent_files.remove(path)
+        self._recent_files.insert(0, path)
+        self._recent_files = self._recent_files[:10]
+        self._save_recents()
+        self._update_recent_menu()
+
+        # Offer to also load the last-attached session for this file.
+        self._maybe_offer_associated_session(path)
+
+        # Refresh dependent UI for the now-active tab.
+        self._refresh_ui_for_active_tab()
+
+    def _maybe_offer_associated_session(self, file_path: str):
+        norm = os.path.normcase(os.path.abspath(file_path))
+        session_path = self._file_session_map.get(norm)
+        if not session_path or not os.path.exists(session_path):
+            if session_path and not os.path.exists(session_path):
+                # Stale association — clean up
+                del self._file_session_map[norm]
+                self._save_file_session_map()
+            return
+        reply = QMessageBox.question(
+            self, "Open Associated Session",
+            f"PyMeasure last opened this file with the session:\n\n"
+            f"{session_path}\n\n"
+            "Open that session too?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._do_load_session(session_path)
 
     def _save_recents(self):
         QSettings("PyMeasure", "PyMeasure").setValue("recentFiles", self._recent_files)
@@ -173,22 +219,42 @@ class MainWindow(QMainWindow):
         self._do_load_session(path)
 
     def _do_load_session(self, path: str):
+        if self.viewer.current_tab_index < 0:
+            QMessageBox.information(
+                self, "Load Session",
+                "Open an image or PDF first, then load a session into its tab.",
+            )
+            return
+
+        dlg = QProgressDialog("Loading session…", None, 0, 0, self)
+        dlg.setWindowTitle("Load Session")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setCancelButton(None)
+        dlg.setAutoClose(False)
+        dlg.show()
+        QApplication.processEvents()
+
+        def on_progress(cur: int, total: int):
+            if total > 0 and dlg.maximum() != total:
+                dlg.setMaximum(total)
+            dlg.setLabelText(f"Loading objects… ({cur} / {total})")
+            dlg.setValue(cur)
+            QApplication.processEvents()
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.viewer.load_session(data)
+            self.viewer.load_session(data, progress=on_progress)
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            dlg.close()
             QMessageBox.critical(self, "Load Session", f"Could not load session:\n{e}")
             return
-        self._rebuild_objects_list()
-        si = self.viewer.scale_info
-        self.left_panel.scale_lbl.setText(f"1 px = {si.scale_factor:.6g} {si.unit}")
-        o  = self.viewer.origin
-        ox, oy = self.viewer._origin_world
-        self.left_panel.origin_lbl.setText(
-            f"Origin: img ({o.x:.1f}, {o.y:.1f})\n  world ({ox:.4g}, {oy:.4g})"
-        )
-        self._current_session_path = path
+        finally:
+            dlg.close()
+        self._refresh_ui_for_active_tab()
+        self.viewer.set_current_tab_session_path(path)
+        self._remember_file_session_link(self.viewer.current_tab_file_path(), path)
         self._status_msg.setText(f"Session loaded from {path}")
         if path in self._recent_sessions:
             self._recent_sessions.remove(path)
@@ -199,6 +265,78 @@ class MainWindow(QMainWindow):
 
     def _save_recent_sessions(self):
         QSettings("PyMeasure", "PyMeasure").setValue("recentSessions", self._recent_sessions)
+
+    # ------------------------------------------------------------------
+    # File ↔ session association memory
+    # ------------------------------------------------------------------
+
+    def _remember_file_session_link(self, file_path: str, session_path: str):
+        if not file_path or not session_path:
+            return
+        norm = os.path.normcase(os.path.abspath(file_path))
+        self._file_session_map[norm] = session_path
+        self._save_file_session_map()
+
+    def _save_file_session_map(self):
+        QSettings("PyMeasure", "PyMeasure").setValue(
+            "fileSessionMap", json.dumps(self._file_session_map),
+        )
+
+    # ------------------------------------------------------------------
+    # Tab events
+    # ------------------------------------------------------------------
+
+    @Slot(int)
+    def _on_tab_changed(self, idx: int):
+        self._refresh_ui_for_active_tab()
+
+    @Slot(int)
+    def _on_tab_close_requested(self, idx: int):
+        if self.viewer.tab_has_session_state(idx):
+            tab_path = self.viewer.tab_file_path(idx) or "Untitled"
+            reply = QMessageBox.question(
+                self, "Close Tab",
+                f"Close “{os.path.basename(tab_path)}”?\n\n"
+                "Unsaved measurements in this tab will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.viewer.close_tab(idx)
+
+    def _refresh_ui_for_active_tab(self):
+        """Sync all dependent panels (objects list, scale, origin, zoom, title, PDF nav)
+        to reflect the current tab — call after a tab switch or session load."""
+        self._rebuild_objects_list()
+
+        if self.viewer.current_tab_index < 0:
+            self.setWindowTitle("PyMeasure")
+            self.left_panel.scale_lbl.setText("Scale: 1 px/px")
+            self.left_panel.origin_lbl.setText("Origin: (0.00, 0.00)")
+            self.left_panel.zoom_lbl.setText("Zoom: 100%")
+            self.left_panel.pdf_box.setVisible(False)
+            self._status_zoom.setText("100%")
+            self._status_msg.setText("")
+            return
+
+        tab_path = self.viewer.current_tab_file_path() or "Untitled"
+        self.setWindowTitle(f"PyMeasure — {os.path.basename(tab_path)}")
+
+        si = self.viewer.scale_info
+        self.left_panel.scale_lbl.setText(f"1 px = {si.scale_factor:.6g} {si.unit}")
+
+        o  = self.viewer.origin
+        ox, oy = self.viewer._origin_world
+        self.left_panel.origin_lbl.setText(
+            f"Origin: img ({o.x:.1f}, {o.y:.1f})\n  world ({ox:.4g}, {oy:.4g})"
+        )
+
+        pct = f"{self.viewer.zoom * 100:.0f}%"
+        self.left_panel.zoom_lbl.setText(f"Zoom: {pct}")
+        self._status_zoom.setText(pct)
+
+        self._update_pdf_nav()
 
     # ------------------------------------------------------------------
     # Status bar
@@ -233,7 +371,7 @@ class MainWindow(QMainWindow):
         self.viewer.mouse_world_pos.connect(self._on_mouse_pos)
         self.viewer.zoom_changed.connect(self._on_zoom_changed)
         self.viewer.live_measure.connect(self._status_live.setText)
-        self.viewer.state_restored.connect(self._rebuild_objects_list)
+        self.viewer.state_restored.connect(self._refresh_ui_for_active_tab)
         self.viewer.tool_change_requested.connect(self._set_tool)
         self.viewer.objects_changed.connect(self._rebuild_objects_list)
         self.viewer.selection_changed.connect(self._on_viewer_selection_changed)
@@ -245,9 +383,14 @@ class MainWindow(QMainWindow):
         self.right_panel.del_obj_btn.clicked.connect(self._on_delete_selected)
         self.right_panel.clear_all_btn.clicked.connect(self._on_clear_all)
         self.right_panel.export_btn.clicked.connect(self.show_export)
+        self.right_panel.move_up_btn.clicked.connect(self.viewer.move_selected_up)
+        self.right_panel.move_down_btn.clicked.connect(self.viewer.move_selected_down)
 
         self.left_panel.prev_page_btn.clicked.connect(self._go_prev_page)
         self.left_panel.next_page_btn.clicked.connect(self._go_next_page)
+
+        self.viewer.tab_changed.connect(self._on_tab_changed)
+        self.viewer.tab_close_requested.connect(self._on_tab_close_requested)
 
     # ------------------------------------------------------------------
     # Slots
@@ -325,15 +468,41 @@ class MainWindow(QMainWindow):
 
     def _on_list_context_menu(self, pos):
         item = self.right_panel.objects_list.itemAt(pos)
-        if item is None:
-            return
-        idx = self.right_panel.objects_list.row(item)
         menu = QMenu(self)
-        menu.addAction("Edit…", lambda: self.viewer.open_edit_dialog_for(idx))
-        menu.addAction("Copy Coordinates", lambda: self._copy_coordinates(idx))
-        menu.addSeparator()
-        menu.addAction("Delete", lambda: self._delete_single(idx))
+
+        if item is not None:
+            idx = self.right_panel.objects_list.row(item)
+            if idx not in self.viewer._selection:
+                self.viewer.set_selection([idx])
+                self.selection_changed_via_panel(idx)
+            menu.addAction("Edit…", lambda: self.viewer.open_edit_dialog_for(idx))
+            menu.addAction("Copy Coordinates", lambda: self._copy_coordinates(idx))
+            menu.addSeparator()
+
+        sel = sorted(self.viewer._selection)
+        copy_a = menu.addAction("Copy", self.viewer.copy_selection)
+        paste_a = menu.addAction("Paste", lambda: self.viewer.paste())
+        dup_a = menu.addAction("Duplicate", lambda: self.viewer.duplicate_selection())
+        copy_a.setEnabled(bool(sel))
+        paste_a.setEnabled(bool(self.viewer._clipboard))
+        dup_a.setEnabled(bool(sel))
+
+        if item is not None:
+            menu.addSeparator()
+            menu.addAction("Delete", lambda: self._delete_single(
+                self.right_panel.objects_list.row(item)))
+
         menu.exec(self.right_panel.objects_list.mapToGlobal(pos))
+
+    def selection_changed_via_panel(self, idx: int):
+        """Sync right-panel list selection to a single row (used by context menu)."""
+        self._syncing_selection = True
+        self.right_panel.objects_list.clearSelection()
+        item = self.right_panel.objects_list.item(idx)
+        if item:
+            item.setSelected(True)
+        self._syncing_selection = False
+        self.viewer.update()
 
     def _copy_coordinates(self, idx: int):
         obj = self.viewer.objects[idx]
@@ -445,26 +614,35 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def save_session(self):
-        if self._current_session_path and os.path.exists(self._current_session_path):
-            self._do_save_session(self._current_session_path)
+        current = self.viewer.current_tab_session_path()
+        if current and os.path.exists(current):
+            self._do_save_session(current)
         else:
             self.save_session_as()
 
     def save_session_as(self):
-        start_dir = self._current_session_path or ""
+        if self.viewer.current_tab_index < 0:
+            QMessageBox.information(
+                self, "Save Session", "Open an image or PDF first.",
+            )
+            return
+        start_dir = self.viewer.current_tab_session_path() or ""
         path, _ = QFileDialog.getSaveFileName(self, "Save Session As", start_dir, "JSON Files (*.json)")
         if not path:
             return
         self._do_save_session(path)
 
     def _do_save_session(self, path: str):
+        if self.viewer.current_tab_index < 0:
+            return
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.viewer.session_data(), f, indent=2)
         except OSError as e:
             QMessageBox.critical(self, "Save Session", f"Could not save session:\n{e}")
             return
-        self._current_session_path = path
+        self.viewer.set_current_tab_session_path(path)
+        self._remember_file_session_link(self.viewer.current_tab_file_path(), path)
         self._status_msg.setText(f"Session saved to {path}")
         if path in self._recent_sessions:
             self._recent_sessions.remove(path)
@@ -483,7 +661,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def show_export(self):
-        ExportDialog(self.viewer.objects, self).exec()
+        to_world = lambda x, y: self.viewer.img_to_world(QPointF(x, y))
+        ExportDialog(self.viewer.objects, to_world, self).exec()
 
     def show_about(self):
         QMessageBox.about(

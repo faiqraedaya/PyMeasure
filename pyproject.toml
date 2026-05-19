@@ -1,6 +1,6 @@
 [project]
-name = "2602p-pymeasure"
-version = "0.1.0"
+name = "PyMeasure"
+version = "1.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "pymupdf>=1.27.2.3",

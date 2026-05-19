@@ -235,11 +235,13 @@ class EditObjectDialog(QDialog):
 
 
 class ExportDialog(QDialog):
-    _FIELDNAMES = ["type", "name", "value", "unit", "timestamp", "points"]
+    _FIELDNAMES = ["type", "name", "value", "unit", "timestamp",
+                   "world_points", "image_points"]
 
-    def __init__(self, objects: List[DiagramObject], parent=None):
+    def __init__(self, objects: List[DiagramObject], to_world=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Data")
+        self._to_world = to_world or (lambda x, y: (x, y))
         self._rows = [self._obj_to_row(o) for o in objects]
 
         self.preview = QListWidget()
@@ -265,18 +267,21 @@ class ExportDialog(QDialog):
         layout.addWidget(self.preview)
         layout.addLayout(btn_row)
         self.setLayout(layout)
-        self.resize(640, 420)
+        self.resize(720, 420)
 
-    @staticmethod
-    def _obj_to_row(obj: DiagramObject) -> dict:
-        pts_str = "; ".join(f"({x:.4f},{y:.4f})" for x, y in obj.points)
+    def _obj_to_row(self, obj: DiagramObject) -> dict:
+        img_str = "; ".join(f"({x:.4f},{y:.4f})" for x, y in obj.points)
+        world_str = "; ".join(
+            "({:.4f},{:.4f})".format(*self._to_world(x, y)) for x, y in obj.points
+        )
         return {
-            "type":      obj.kind,
-            "name":      obj.name,
-            "value":     obj.value if obj.kind != "point" else "",
-            "unit":      obj.unit  if obj.kind != "point" else "",
-            "timestamp": obj.timestamp,
-            "points":    pts_str,
+            "type":         obj.kind,
+            "name":         obj.name,
+            "value":        obj.value if obj.kind != "point" else "",
+            "unit":         obj.unit  if obj.kind != "point" else "",
+            "timestamp":    obj.timestamp,
+            "world_points": world_str,
+            "image_points": img_str,
         }
 
     def _export_csv(self):

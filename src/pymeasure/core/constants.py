@@ -3,6 +3,7 @@ from enum import Enum
 
 class Tool(Enum):
     PAN                  = "pan"
+    SELECT               = "select"
     ZOOM_RECT            = "zoom_rect"
     SET_ORIGIN           = "set_origin"
     SET_SCALE_DISTANCE   = "set_scale_distance"
@@ -16,6 +17,7 @@ class Tool(Enum):
 
 TOOL_LABELS = {
     Tool.PAN:                "Pan / Zoom",
+    Tool.SELECT:             "Select",
     Tool.ZOOM_RECT:          "Zoom Rectangle",
     Tool.SET_ORIGIN:         "Set Origin",
     Tool.SET_SCALE_DISTANCE: "Scale – Distance",
@@ -29,6 +31,7 @@ TOOL_LABELS = {
 
 TOOL_SHORTCUTS = {
     Tool.PAN:                "Space",
+    Tool.SELECT:             "V",
     Tool.ZOOM_RECT:          "Z",
     Tool.SET_ORIGIN:         "O",
     Tool.SET_SCALE_DISTANCE: "S",
@@ -42,6 +45,7 @@ TOOL_SHORTCUTS = {
 
 TOOL_HELP = {
     Tool.PAN:                "Pan/Zoom — drag to pan · scroll to zoom · Ctrl+0 to fit",
+    Tool.SELECT:             "Select — click an object or drag a box to select · middle-drag to pan · Ctrl+drag to add",
     Tool.ZOOM_RECT:          "Zoom Rectangle — drag to draw a rectangle and zoom into it",
     Tool.SET_ORIGIN:         "Set Origin — click to place the coordinate origin",
     Tool.SET_SCALE_DISTANCE: "Scale (Distance) — click 2 points of known distance",

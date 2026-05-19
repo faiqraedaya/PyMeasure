@@ -72,7 +72,6 @@ class RightPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumWidth(220)
-        self.setMaximumWidth(340)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -88,16 +87,23 @@ class RightPanel(QWidget):
             "Click to select · Ctrl+click to toggle · Shift+click for range\n"
             "Double-click to edit · Right-click for context menu"
         )
-        obj_layout.addWidget(self.objects_list)
+        obj_layout.addWidget(self.objects_list, 1)
 
-        btn_row = QHBoxLayout()
-        self.del_obj_btn   = QPushButton("Delete")
-        self.clear_all_btn = QPushButton("Clear All")
-        self.export_btn    = QPushButton("Export…")
-        btn_row.addWidget(self.del_obj_btn)
-        btn_row.addWidget(self.clear_all_btn)
-        btn_row.addWidget(self.export_btn)
-        obj_layout.addLayout(btn_row)
+        move_row = QHBoxLayout()
+        self.move_up_btn   = QPushButton("Move Up")
+        self.move_down_btn = QPushButton("Move Down")
+        move_row.addWidget(self.move_up_btn)
+        move_row.addWidget(self.move_down_btn)
+        obj_layout.addLayout(move_row)
 
-        outer.addWidget(obj_box)
-        outer.addStretch()
+        del_row = QHBoxLayout()
+        self.del_obj_btn   = QPushButton("Delete Selected")
+        self.clear_all_btn = QPushButton("Delete All")
+        del_row.addWidget(self.del_obj_btn)
+        del_row.addWidget(self.clear_all_btn)
+        obj_layout.addLayout(del_row)
+
+        self.export_btn = QPushButton("Export…")
+        obj_layout.addWidget(self.export_btn)
+
+        outer.addWidget(obj_box, 1)

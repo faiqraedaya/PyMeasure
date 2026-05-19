@@ -1,5 +1,7 @@
 import math
+import os
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -8,7 +10,9 @@ from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF,
 )
-from PySide6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QSizePolicy, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QMenu, QMessageBox, QSizePolicy, QTabBar, QWidget,
+)
 
 from ..core.constants import Tool
 from .dialogs import (
@@ -26,7 +30,7 @@ _KIND_COLOR = {
     "area":     QColor("#ff6699"),
     "polyline": QColor("#44ddaa"),
 }
-_SEL_COLOR   = QColor("#00ddff")
+_SEL_COLOR   = QColor("#ff2222")
 _LABEL_COLOR = QColor("#dd0000")
 _PREVIEW_COLOR = QColor("#dd0000")
 
@@ -76,6 +80,41 @@ def _seg_insert_point(screen_pos: QPointF, sa: QPointF, sb: QPointF) -> QPointF:
 
 
 # ---------------------------------------------------------------------------
+# DocumentTab — per-document state held by ImageViewer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DocumentTab:
+    """All state that belongs to a single opened document (image or PDF)."""
+    file_path: str = ""
+    pixmap: Optional[QPixmap] = None
+    pdf_doc: object = None              # fitz.Document or None
+    pdf_page_index: int = 0
+    pdf_dpi: int = 150
+
+    zoom: float = 1.0
+    pan: QPointF = field(default_factory=QPointF)
+
+    origin: Point = field(default_factory=lambda: Point(0.0, 0.0))
+    origin_world: Tuple[float, float] = (0.0, 0.0)
+    scale_info: ScaleInfo = field(default_factory=lambda: ScaleInfo(1.0, 1.0, "px"))
+
+    temp: List[Point] = field(default_factory=list)
+    objects: List[DiagramObject] = field(default_factory=list)
+    selection: set = field(default_factory=set)
+
+    undo_stack: List[dict] = field(default_factory=list)
+    redo_stack: List[dict] = field(default_factory=list)
+
+    session_path: Optional[str] = None
+
+    def display_label(self) -> str:
+        if not self.file_path:
+            return "Untitled"
+        return os.path.basename(self.file_path)
+
+
+# ---------------------------------------------------------------------------
 # ImageViewer
 # ---------------------------------------------------------------------------
 
@@ -94,36 +133,25 @@ class ImageViewer(QWidget):
     selection_changed     = Signal(list)
     delete_requested      = Signal()
 
+    # Tab lifecycle
+    tab_changed          = Signal(int)     # active tab index changed (or -1)
+    tab_added            = Signal(int)
+    tab_closed           = Signal(int)
+    tab_close_requested  = Signal(int)     # user clicked X — MainWindow decides
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._pixmap: Optional[QPixmap] = None
-        self._pdf_doc = None
-        self._pdf_page_index = 0
-        self._pdf_dpi = 150
+        # --- Shared (cross-tab) state ---
+        self.current_tool  = Tool.PAN
+        self._clipboard: List[DiagramObject] = []
+        self._mouse_img: Optional[QPointF] = None
 
-        self._zoom = 1.0
-        self._pan  = QPointF(0.0, 0.0)
+        # Transient interaction state (also cross-tab; cancelled on tab switch)
         self._panning      = False
         self._pan_start_screen = QPointF()
         self._pan_start_pan    = QPointF()
         self._pan_moved        = False
-
-        self.origin        = Point(0.0, 0.0)
-        self._origin_world = (0.0, 0.0)
-        self.scale_info    = ScaleInfo(1.0, 1.0, "px")
-        self.current_tool  = Tool.PAN
-
-        self._temp: List[Point] = []
-        self.objects: List[DiagramObject] = []
-        self._clipboard: List[DiagramObject] = []
-        self._selection: set = set()
-
-        self._undo_stack: List[dict] = []
-        self._redo_stack: List[dict] = []
-
-        self._mouse_img: Optional[QPointF] = None
-        self._shift_held = False
 
         # Vertex drag (in PAN mode, on selected object)
         self._vtx_drag_obj    = -1
@@ -144,10 +172,343 @@ class ImageViewer(QWidget):
         # Zoom-rect tool
         self._zoom_rect_start: Optional[QPointF] = None   # screen coords
 
+        # Box-select tool
+        self._box_sel_start: Optional[QPointF] = None     # screen coords
+        self._box_sel_additive = False                    # Ctrl-drag → add to selection
+        self._box_sel_base: set = set()                   # selection at drag start
+
+        # View toggles
+        self._show_objects = True
+
+        # Arrow-key nudge burst tracking
+        self._nudge_burst_active = False
+
+        # --- Tabs ---
+        self._tabs: List[DocumentTab] = []
+        self._active_idx: int = -1
+        self._suppress_tab_signal = False
+
+        # Tab bar (positioned at top by resizeEvent)
+        self._tab_bar = QTabBar(self)
+        self._tab_bar.setTabsClosable(True)
+        self._tab_bar.setMovable(True)
+        self._tab_bar.setDocumentMode(True)
+        self._tab_bar.setExpanding(False)
+        self._tab_bar.setDrawBase(False)
+        self._tab_bar.setUsesScrollButtons(True)
+        self._tab_bar.currentChanged.connect(self._on_tab_bar_current_changed)
+        self._tab_bar.tabCloseRequested.connect(self._on_tab_bar_close_requested)
+        self._tab_bar.tabMoved.connect(self._on_tab_bar_moved)
+        self._tab_bar.hide()
+
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    # ------------------------------------------------------------------
+    # Per-tab state — delegating properties
+    # ------------------------------------------------------------------
+
+    @property
+    def _active(self) -> Optional[DocumentTab]:
+        if 0 <= self._active_idx < len(self._tabs):
+            return self._tabs[self._active_idx]
+        return None
+
+    @property
+    def _pixmap(self) -> Optional[QPixmap]:
+        return self._active.pixmap if self._active else None
+    @_pixmap.setter
+    def _pixmap(self, val):
+        if self._active is not None:
+            self._active.pixmap = val
+
+    @property
+    def _pdf_doc(self):
+        return self._active.pdf_doc if self._active else None
+    @_pdf_doc.setter
+    def _pdf_doc(self, val):
+        if self._active is not None:
+            self._active.pdf_doc = val
+
+    @property
+    def _pdf_page_index(self) -> int:
+        return self._active.pdf_page_index if self._active else 0
+    @_pdf_page_index.setter
+    def _pdf_page_index(self, val):
+        if self._active is not None:
+            self._active.pdf_page_index = val
+
+    @property
+    def _pdf_dpi(self) -> int:
+        return self._active.pdf_dpi if self._active else 150
+    @_pdf_dpi.setter
+    def _pdf_dpi(self, val):
+        if self._active is not None:
+            self._active.pdf_dpi = val
+
+    @property
+    def _zoom(self) -> float:
+        return self._active.zoom if self._active else 1.0
+    @_zoom.setter
+    def _zoom(self, val):
+        if self._active is not None:
+            self._active.zoom = val
+
+    @property
+    def _pan(self) -> QPointF:
+        return self._active.pan if self._active else QPointF(0.0, 0.0)
+    @_pan.setter
+    def _pan(self, val):
+        if self._active is not None:
+            self._active.pan = val
+
+    @property
+    def origin(self) -> Point:
+        return self._active.origin if self._active else Point(0.0, 0.0)
+    @origin.setter
+    def origin(self, val):
+        if self._active is not None:
+            self._active.origin = val
+
+    @property
+    def _origin_world(self) -> Tuple[float, float]:
+        return self._active.origin_world if self._active else (0.0, 0.0)
+    @_origin_world.setter
+    def _origin_world(self, val):
+        if self._active is not None:
+            self._active.origin_world = val
+
+    @property
+    def scale_info(self) -> ScaleInfo:
+        return self._active.scale_info if self._active else ScaleInfo(1.0, 1.0, "px")
+    @scale_info.setter
+    def scale_info(self, val):
+        if self._active is not None:
+            self._active.scale_info = val
+
+    @property
+    def _temp(self) -> List[Point]:
+        return self._active.temp if self._active else []
+    @_temp.setter
+    def _temp(self, val):
+        if self._active is not None:
+            self._active.temp = val
+
+    @property
+    def objects(self) -> List[DiagramObject]:
+        return self._active.objects if self._active else []
+    @objects.setter
+    def objects(self, val):
+        if self._active is not None:
+            self._active.objects = val
+
+    @property
+    def _selection(self) -> set:
+        return self._active.selection if self._active else set()
+    @_selection.setter
+    def _selection(self, val):
+        if self._active is not None:
+            self._active.selection = val
+
+    @property
+    def _undo_stack(self) -> List[dict]:
+        return self._active.undo_stack if self._active else []
+    @_undo_stack.setter
+    def _undo_stack(self, val):
+        if self._active is not None:
+            self._active.undo_stack = val
+
+    @property
+    def _redo_stack(self) -> List[dict]:
+        return self._active.redo_stack if self._active else []
+    @_redo_stack.setter
+    def _redo_stack(self, val):
+        if self._active is not None:
+            self._active.redo_stack = val
+
+    # ------------------------------------------------------------------
+    # Tab management
+    # ------------------------------------------------------------------
+
+    @property
+    def tab_count(self) -> int:
+        return len(self._tabs)
+
+    @property
+    def current_tab_index(self) -> int:
+        return self._active_idx
+
+    def tab_file_path(self, idx: int) -> str:
+        if 0 <= idx < len(self._tabs):
+            return self._tabs[idx].file_path
+        return ""
+
+    def current_tab_file_path(self) -> str:
+        return self._active.file_path if self._active else ""
+
+    def current_tab_session_path(self) -> Optional[str]:
+        return self._active.session_path if self._active else None
+
+    def set_current_tab_session_path(self, path: Optional[str]):
+        if self._active is not None:
+            self._active.session_path = path
+
+    def tabs_iter(self):
+        """Iterate (index, DocumentTab) for all tabs."""
+        return enumerate(self._tabs)
+
+    def add_tab(self, file_path: str = "", activate: bool = True) -> int:
+        """Create a new (empty) tab and optionally make it active."""
+        tab = DocumentTab(file_path=file_path)
+        self._tabs.append(tab)
+        idx = len(self._tabs) - 1
+
+        self._suppress_tab_signal = True
+        self._tab_bar.addTab(self._tab_label_for(tab))
+        self._tab_bar.setTabToolTip(idx, file_path or "Untitled")
+        self._tab_bar.show()
+        self._suppress_tab_signal = False
+
+        self.tab_added.emit(idx)
+        if activate:
+            self.set_current_tab(idx)
+        self._update_geometry()
+        return idx
+
+    def close_tab(self, idx: int) -> bool:
+        """Close the tab at idx. Returns True if removed."""
+        if not (0 <= idx < len(self._tabs)):
+            return False
+        tab = self._tabs[idx]
+        if tab.pdf_doc is not None:
+            try:
+                tab.pdf_doc.close()
+            except Exception:
+                pass
+
+        del self._tabs[idx]
+
+        self._suppress_tab_signal = True
+        self._tab_bar.removeTab(idx)
+        self._suppress_tab_signal = False
+
+        if not self._tabs:
+            self._active_idx = -1
+            self._tab_bar.hide()
+            self._cancel_transient_interactions()
+            self.tab_closed.emit(idx)
+            self.tab_changed.emit(-1)
+            self.update()
+            self._update_geometry()
+            return True
+
+        # Adjust active index to stay valid
+        new_active = self._tab_bar.currentIndex()
+        if new_active < 0:
+            new_active = min(idx, len(self._tabs) - 1)
+        self._active_idx = new_active
+        self._cancel_transient_interactions()
+        self.tab_closed.emit(idx)
+        self.tab_changed.emit(self._active_idx)
+        self.update()
+        self._update_geometry()
+        return True
+
+    def set_current_tab(self, idx: int):
+        if not (0 <= idx < len(self._tabs)):
+            return
+        if idx == self._active_idx:
+            # Make sure tab bar reflects it
+            if self._tab_bar.currentIndex() != idx:
+                self._suppress_tab_signal = True
+                self._tab_bar.setCurrentIndex(idx)
+                self._suppress_tab_signal = False
+            return
+        self._cancel_transient_interactions()
+        self._active_idx = idx
+        if self._tab_bar.currentIndex() != idx:
+            self._suppress_tab_signal = True
+            self._tab_bar.setCurrentIndex(idx)
+            self._suppress_tab_signal = False
+        self.tab_changed.emit(idx)
+        self.update()
+
+    def refresh_tab_label(self, idx: int):
+        if 0 <= idx < len(self._tabs):
+            tab = self._tabs[idx]
+            self._tab_bar.setTabText(idx, self._tab_label_for(tab))
+            self._tab_bar.setTabToolTip(idx, tab.file_path or "Untitled")
+
+    def _tab_label_for(self, tab: DocumentTab) -> str:
+        label = tab.display_label()
+        if tab.pdf_doc is not None and len(tab.pdf_doc) > 1:
+            label = f"{label}  [{tab.pdf_page_index + 1}/{len(tab.pdf_doc)}]"
+        return label
+
+    def _cancel_transient_interactions(self):
+        self._panning = False
+        self._pan_moved = False
+        self._vtx_drag_active = False
+        self._vtx_drag_obj = -1
+        self._vtx_drag_vtx = -1
+        self._vtx_drag_start_pts = []
+        self._sel_drag_active = False
+        self._sel_press_obj = -1
+        self._sel_press_pos = None
+        self._zoom_rect_start = None
+        self._box_sel_start = None
+        self._box_sel_base = set()
+        self._nudge_burst_active = False
+
+    def _on_tab_bar_current_changed(self, idx: int):
+        if self._suppress_tab_signal:
+            return
+        if 0 <= idx < len(self._tabs):
+            self.set_current_tab(idx)
+
+    def _on_tab_bar_close_requested(self, idx: int):
+        # MainWindow decides whether to close (with confirmation if needed).
+        self.tab_close_requested.emit(idx)
+
+    def _on_tab_bar_moved(self, from_idx: int, to_idx: int):
+        if from_idx == to_idx:
+            return
+        tab = self._tabs.pop(from_idx)
+        self._tabs.insert(to_idx, tab)
+        self._active_idx = self._tab_bar.currentIndex()
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Canvas-area helpers (region below the tab bar)
+    # ------------------------------------------------------------------
+
+    def _canvas_top(self) -> int:
+        return self._tab_bar.height() if self._tab_bar.isVisible() else 0
+
+    def _canvas_width(self) -> int:
+        return self.width()
+
+    def _canvas_height(self) -> int:
+        return max(0, self.height() - self._canvas_top())
+
+    def _canvas_center(self) -> Tuple[float, float]:
+        top = self._canvas_top()
+        return self.width() / 2.0, top + (self.height() - top) / 2.0
+
+    def _update_geometry(self):
+        """Reposition the tab bar across the top of the viewer."""
+        if self._tabs:
+            h = self._tab_bar.sizeHint().height()
+            self._tab_bar.setGeometry(0, 0, self.width(), h)
+            self._tab_bar.show()
+        else:
+            self._tab_bar.hide()
+
+    def resizeEvent(self, event):
+        self._update_geometry()
+        super().resizeEvent(event)
 
     # ------------------------------------------------------------------
     # Properties
@@ -156,6 +517,16 @@ class ImageViewer(QWidget):
     @property
     def zoom(self) -> float:
         return self._zoom
+
+    @property
+    def objects_visible(self) -> bool:
+        return self._show_objects
+
+    def set_objects_visible(self, visible: bool):
+        if self._show_objects == visible:
+            return
+        self._show_objects = visible
+        self.update()
 
     @property
     def current_page(self) -> int:
@@ -170,14 +541,14 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def _img_to_screen(self, img_pt: QPointF) -> QPointF:
-        cx, cy = self.width() / 2, self.height() / 2
+        cx, cy = self._canvas_center()
         return QPointF(
             (img_pt.x() - self._pan.x()) * self._zoom + cx,
             (img_pt.y() - self._pan.y()) * self._zoom + cy,
         )
 
     def _screen_to_img(self, screen_pt: QPointF) -> QPointF:
-        cx, cy = self.width() / 2, self.height() / 2
+        cx, cy = self._canvas_center()
         return QPointF(
             (screen_pt.x() - cx) / self._zoom + self._pan.x(),
             (screen_pt.y() - cy) / self._zoom + self._pan.y(),
@@ -202,10 +573,29 @@ class ImageViewer(QWidget):
     # File loading
     # ------------------------------------------------------------------
 
+    def open_in_new_tab(self, path: str) -> int:
+        """Open `path` as a brand-new tab. Returns tab index, or -1 on failure."""
+        idx = self.add_tab(file_path=path, activate=True)
+        if not self.load_file(path):
+            # Roll back: remove the failed tab
+            self.close_tab(idx)
+            return -1
+        # Refresh the label (may now reflect PDF page count etc.)
+        self.refresh_tab_label(idx)
+        return idx
+
     def load_file(self, path: str) -> bool:
+        """Load `path` into the currently-active tab."""
+        if self._active is None:
+            # Create a tab implicitly
+            self.add_tab(file_path=path, activate=True)
+        else:
+            self._active.file_path = path
         ok = self._load_pdf(path) if path.lower().endswith(".pdf") else self._load_image(path)
         if ok:
             self.fit_to_window()
+            if self._active is not None:
+                self.refresh_tab_label(self._active_idx)
         return ok
 
     def _load_image(self, path: str) -> bool:
@@ -249,6 +639,8 @@ class ImageViewer(QWidget):
             return
         self._pdf_page_index = clamped
         if self._render_pdf_page():
+            if self._active is not None:
+                self.refresh_tab_label(self._active_idx)
             self.update()
 
     def set_pdf_dpi(self, dpi: int):
@@ -267,8 +659,8 @@ class ImageViewer(QWidget):
         iw, ih = self._pixmap.width(), self._pixmap.height()
         if iw == 0 or ih == 0:
             return
-        w = self.width() or 800
-        h = self.height() or 600
+        w = self._canvas_width() or 800
+        h = self._canvas_height() or 600
         self._zoom = min(w / iw, h / ih) * 0.95
         self._pan  = QPointF(iw / 2, ih / 2)
         self.zoom_changed.emit(self._zoom)
@@ -283,6 +675,28 @@ class ImageViewer(QWidget):
         """Set cursor based on tool and what is under screen_pos."""
         if self.current_tool == Tool.ZOOM_RECT:
             self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        if self.current_tool == Tool.SELECT:
+            if self._panning or self._vtx_drag_active or self._sel_drag_active:
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return
+            if self._box_sel_start is not None:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+            if screen_pos is not None:
+                for i in self._selection:
+                    obj = self.objects[i]
+                    if obj.kind == "point":
+                        continue
+                    for vx, vy in obj.points:
+                        sp = self._img_to_screen(QPointF(vx, vy))
+                        if math.hypot(sp.x() - screen_pos.x(), sp.y() - screen_pos.y()) <= _HIT_R:
+                            self.setCursor(Qt.CursorShape.PointingHandCursor)
+                            return
+                if self._hit_object(screen_pos) >= 0:
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                    return
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             return
         if self.current_tool != Tool.PAN:
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -314,25 +728,37 @@ class ImageViewer(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#2b2b2b"))
+
+        top = self._canvas_top()
+        canvas_rect = QRectF(0, top, self.width(), max(0, self.height() - top))
+        painter.fillRect(canvas_rect, QColor("#2b2b2b"))
 
         if self._pixmap is None:
             painter.setPen(QColor("#888888"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                             "Open an image or PDF to get started")
+            msg = ("Open an image or PDF to get started"
+                   if self._active is None else "Loading…")
+            painter.drawText(canvas_rect, Qt.AlignmentFlag.AlignCenter, msg)
             return
 
+        # Clip drawing to the canvas area so nothing bleeds under the tab bar.
+        painter.save()
+        painter.setClipRect(canvas_rect)
+
         iw, ih = self._pixmap.width(), self._pixmap.height()
-        cx, cy = self.width() / 2, self.height() / 2
+        cx, cy = self._canvas_center()
         x0 = cx - self._pan.x() * self._zoom
         y0 = cy - self._pan.y() * self._zoom
         dest = QRectF(x0, y0, iw * self._zoom, ih * self._zoom)
         painter.drawPixmap(dest, self._pixmap, QRectF(self._pixmap.rect()))
 
         self._paint_origin(painter)
-        self._paint_objects(painter)
+        if self._show_objects:
+            self._paint_objects(painter)
         self._paint_temp(painter)
         self._paint_zoom_rect(painter)
+        self._paint_box_select(painter)
+
+        painter.restore()
 
     def _paint_origin(self, painter: QPainter):
         sp = self._img_to_screen(QPointF(self.origin.x, self.origin.y))
@@ -369,13 +795,9 @@ class ImageViewer(QWidget):
         if not obj.points:
             return
         sp = self._img_to_screen(QPointF(*obj.points[0]))
-        color = _KIND_COLOR["point"]
-        if selected:
-            painter.setPen(QPen(_SEL_COLOR, 2))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(sp, 9.0, 9.0)
+        fill_color = _SEL_COLOR if selected else _KIND_COLOR["point"]
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(color))
+        painter.setBrush(QBrush(fill_color))
         painter.drawEllipse(sp, 5.0, 5.0)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         label = obj.name or f"P{idx + 1}"
@@ -388,12 +810,10 @@ class ImageViewer(QWidget):
     def _paint_distance(self, painter, obj, color, selected):
         if len(obj.points) < 2:
             return
+        draw_color = _SEL_COLOR if selected else color
         sp0 = self._img_to_screen(QPointF(*obj.points[0]))
         sp1 = self._img_to_screen(QPointF(*obj.points[1]))
-        if selected:
-            painter.setPen(QPen(_SEL_COLOR, 4))
-            painter.drawLine(sp0, sp1)
-        painter.setPen(QPen(color, 2))
+        painter.setPen(QPen(draw_color, 2))
         painter.drawLine(sp0, sp1)
         mid = QPointF((sp0.x() + sp1.x()) / 2, (sp0.y() + sp1.y()) / 2)
         painter.setPen(_LABEL_COLOR)
@@ -403,12 +823,9 @@ class ImageViewer(QWidget):
     def _paint_angle(self, painter, obj, color, selected):
         if len(obj.points) < 3:
             return
+        draw_color = _SEL_COLOR if selected else color
         sp = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-        if selected:
-            painter.setPen(QPen(_SEL_COLOR, 4))
-            painter.drawLine(sp[0], sp[1])
-            painter.drawLine(sp[2], sp[1])
-        painter.setPen(QPen(color, 2))
+        painter.setPen(QPen(draw_color, 2))
         painter.drawLine(sp[0], sp[1])
         painter.drawLine(sp[2], sp[1])
         painter.setPen(_LABEL_COLOR)
@@ -418,15 +835,12 @@ class ImageViewer(QWidget):
     def _paint_area(self, painter, obj, color, selected):
         if len(obj.points) < 3:
             return
+        draw_color = _SEL_COLOR if selected else color
         sps = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-        if selected:
-            painter.setPen(QPen(_SEL_COLOR, 4))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPolygon(QPolygonF(sps))
-        fill = QColor(color)
+        fill = QColor(draw_color)
         fill.setAlpha(40)
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(color, 2))
+        painter.setPen(QPen(draw_color, 2))
         painter.drawPolygon(QPolygonF(sps))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         cx = sum(s.x() for s in sps) / len(sps)
@@ -438,12 +852,9 @@ class ImageViewer(QWidget):
     def _paint_polyline(self, painter, obj, color, selected):
         if len(obj.points) < 2:
             return
+        draw_color = _SEL_COLOR if selected else color
         sps = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-        if selected:
-            painter.setPen(QPen(_SEL_COLOR, 4))
-            for i in range(len(sps) - 1):
-                painter.drawLine(sps[i], sps[i + 1])
-        painter.setPen(QPen(color, 2))
+        painter.setPen(QPen(draw_color, 2))
         for i in range(len(sps) - 1):
             painter.drawLine(sps[i], sps[i + 1])
         mid = sps[len(sps) // 2]
@@ -533,13 +944,33 @@ class ImageViewer(QWidget):
         painter.drawRect(rect)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
+    def _paint_box_select(self, painter: QPainter):
+        if self.current_tool != Tool.SELECT or self._box_sel_start is None:
+            return
+        if self._mouse_img is None:
+            return
+        s0 = self._box_sel_start
+        s1 = self._img_to_screen(self._mouse_img)
+        rect = QRectF(s0, s1).normalized()
+        painter.setPen(QPen(QColor("#ff2222"), 1, Qt.PenStyle.DashLine))
+        fill = QColor("#ff2222")
+        fill.setAlpha(35)
+        painter.setBrush(QBrush(fill))
+        painter.drawRect(rect)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
     def _preview_screen_pt(self) -> Optional[QPointF]:
         if self._mouse_img is None or not self._temp:
             return None
         return self._img_to_screen(self._apply_snap(self._mouse_img))
 
+    def _shift_pressed(self) -> bool:
+        return bool(
+            QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+        )
+
     def _apply_snap(self, img_pos: QPointF) -> QPointF:
-        if self._shift_held and self._temp:
+        if self._shift_pressed() and self._temp:
             return _snap_cardinal(QPointF(self._temp[-1].x, self._temp[-1].y), img_pos)
         return img_pos
 
@@ -554,6 +985,8 @@ class ImageViewer(QWidget):
         self._sel_drag_active = False
         self._sel_press_obj   = -1
         self._zoom_rect_start = None
+        self._box_sel_start   = None
+        self._box_sel_base    = set()
         self.current_tool = tool
         self._temp.clear()
         self._update_cursor_for_pos()
@@ -564,6 +997,9 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        if self._active is None:
+            return
+        self._nudge_burst_active = False
         pos = QPointF(event.position())
         btn = event.button()
 
@@ -576,7 +1012,7 @@ class ImageViewer(QWidget):
                 self._zoom_rect_start = pos
                 return
 
-            if self.current_tool == Tool.PAN:
+            if self.current_tool in (Tool.PAN, Tool.SELECT):
                 # Vertex drag on selected object?
                 vtx_obj, vtx_idx = self._hit_selected_vertex(pos)
                 if vtx_obj >= 0:
@@ -586,6 +1022,15 @@ class ImageViewer(QWidget):
                 if hit >= 0:
                     self._sel_press_obj = hit
                     self._sel_press_pos = pos
+                elif self.current_tool == Tool.SELECT:
+                    # Empty space → start box selection (no left-drag pan in SELECT)
+                    self._box_sel_start = pos
+                    self._box_sel_additive = bool(
+                        event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                    )
+                    self._box_sel_base = (
+                        set(self._selection) if self._box_sel_additive else set()
+                    )
                 else:
                     self._start_pan(pos)
             else:
@@ -656,6 +1101,10 @@ class ImageViewer(QWidget):
             self.update()
             return
 
+        if self.current_tool == Tool.SELECT and self._box_sel_start is not None:
+            self.update()
+            return
+
         # Update hover cursor
         self._update_cursor_for_pos(pos)
         self.update()
@@ -683,7 +1132,7 @@ class ImageViewer(QWidget):
             self.update()
             return
 
-        if btn == Qt.MouseButton.LeftButton and self.current_tool == Tool.PAN:
+        if btn == Qt.MouseButton.LeftButton and self.current_tool in (Tool.PAN, Tool.SELECT):
             if self._sel_drag_active:
                 self._undo_stack.append(self._sel_drag_snap)
                 self._redo_stack.clear()
@@ -697,6 +1146,8 @@ class ImageViewer(QWidget):
                 self._handle_selection_click(self._sel_press_obj, event.modifiers())
                 self._sel_press_obj = -1
                 self._sel_press_pos = None
+            elif self.current_tool == Tool.SELECT and self._box_sel_start is not None:
+                self._finish_box_select(QPointF(event.position()))
 
         if btn == Qt.MouseButton.LeftButton and self.current_tool == Tool.ZOOM_RECT:
             self._finish_zoom_rect(QPointF(event.position()))
@@ -716,11 +1167,13 @@ class ImageViewer(QWidget):
             self._finish_polyline()
 
     def wheelEvent(self, event):
+        if self._active is None:
+            return
         pos = QPointF(event.position())
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
         mouse_img = self._screen_to_img(pos)
         self._zoom = max(0.05, min(20.0, self._zoom * factor))
-        cx, cy = self.width() / 2, self.height() / 2
+        cx, cy = self._canvas_center()
         self._pan = QPointF(
             mouse_img.x() - (pos.x() - cx) / self._zoom,
             mouse_img.y() - (pos.y() - cy) / self._zoom,
@@ -735,6 +1188,10 @@ class ImageViewer(QWidget):
         if key == Qt.Key.Key_Escape:
             if self._vtx_drag_active:
                 self._cancel_vtx_drag()
+            elif self._box_sel_start is not None:
+                self._box_sel_start = None
+                self._box_sel_base = set()
+                self.update()
             elif self._selection:
                 self._selection.clear()
                 self.selection_changed.emit([])
@@ -750,8 +1207,14 @@ class ImageViewer(QWidget):
         elif key == Qt.Key.Key_Delete and self.current_tool == Tool.PAN and self._selection:
             self.delete_requested.emit()
 
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down) \
+                and self.current_tool == Tool.PAN and self._selection:
+            step = 10.0 if (mods & Qt.KeyboardModifier.ShiftModifier) else 1.0
+            dx = -step if key == Qt.Key.Key_Left else step if key == Qt.Key.Key_Right else 0.0
+            dy = -step if key == Qt.Key.Key_Up   else step if key == Qt.Key.Key_Down  else 0.0
+            self._nudge_selection(dx, dy, autorepeat=event.isAutoRepeat())
+
         elif key == Qt.Key.Key_Shift:
-            self._shift_held = True
             self.update()
 
         elif mods & Qt.KeyboardModifier.ControlModifier:
@@ -770,8 +1233,11 @@ class ImageViewer(QWidget):
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Shift:
-            self._shift_held = False
             self.update()
+        elif event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                              Qt.Key.Key_Up, Qt.Key.Key_Down):
+            if not event.isAutoRepeat():
+                self._nudge_burst_active = False
         else:
             super().keyReleaseEvent(event)
 
@@ -843,17 +1309,96 @@ class ImageViewer(QWidget):
             off_x = img_pos.x() - cx
             off_y = img_pos.y() - cy
         else:
-            off_x = off_y = 20.0
+            off_x = off_y = 0.0
 
         self._push_undo()
         base = len(self.objects)
         for obj in self._clipboard:
             new_obj = deepcopy(obj)
             new_obj.points = [[x + off_x, y + off_y] for x, y in new_obj.points]
+            new_obj.name = self._copy_name(new_obj.name)
             new_obj.timestamp = datetime.now().strftime("%H:%M:%S")
             self.objects.append(new_obj)
 
         self._selection = set(range(base, len(self.objects)))
+        self.selection_changed.emit(sorted(self._selection))
+        self.objects_changed.emit()
+        self.update()
+
+    @staticmethod
+    def _copy_name(name: str) -> str:
+        base = name if name else ""
+        return f"{base} - Copy" if base else "Copy"
+
+    def duplicate_selection(self, screen_pos: Optional[QPointF] = None):
+        """Duplicate currently-selected objects at the same coordinates."""
+        if not self._selection:
+            return
+        sel_sorted = sorted(self._selection)
+        sources = [deepcopy(self.objects[i]) for i in sel_sorted]
+
+        self._push_undo()
+        base = len(self.objects)
+        for obj in sources:
+            new_obj = deepcopy(obj)
+            new_obj.name = self._copy_name(new_obj.name)
+            new_obj.timestamp = datetime.now().strftime("%H:%M:%S")
+            self.objects.append(new_obj)
+
+        self._selection = set(range(base, len(self.objects)))
+        self.selection_changed.emit(sorted(self._selection))
+        self.objects_changed.emit()
+        self.update()
+
+    def _nudge_selection(self, dx: float, dy: float, autorepeat: bool = False):
+        """Shift selected objects by (dx, dy) image pixels. One undo per burst."""
+        if not self._selection or (dx == 0.0 and dy == 0.0):
+            return
+        if not self._nudge_burst_active:
+            self._push_undo()
+            self._nudge_burst_active = True
+        for i in self._selection:
+            obj = self.objects[i]
+            obj.points = [[x + dx, y + dy] for x, y in obj.points]
+            if obj.kind != "point":
+                self._recalculate_object(obj)
+        self.objects_changed.emit()
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Reordering
+    # ------------------------------------------------------------------
+
+    def move_selected_up(self):
+        """Move each selected object one slot earlier in the list."""
+        if not self._selection:
+            return
+        sel_sorted = sorted(self._selection)
+        if sel_sorted[0] == 0:
+            return
+        self._push_undo()
+        new_sel = set()
+        for i in sel_sorted:
+            self.objects[i - 1], self.objects[i] = self.objects[i], self.objects[i - 1]
+            new_sel.add(i - 1)
+        self._selection = new_sel
+        self.selection_changed.emit(sorted(self._selection))
+        self.objects_changed.emit()
+        self.update()
+
+    def move_selected_down(self):
+        """Move each selected object one slot later in the list."""
+        if not self._selection:
+            return
+        sel_sorted = sorted(self._selection, reverse=True)
+        if sel_sorted[0] == len(self.objects) - 1:
+            return
+        self._push_undo()
+        new_sel = set()
+        for i in sel_sorted:
+            self.objects[i + 1], self.objects[i] = self.objects[i], self.objects[i + 1]
+            new_sel.add(i + 1)
+        self._selection = new_sel
         self.selection_changed.emit(sorted(self._selection))
         self.objects_changed.emit()
         self.update()
@@ -895,7 +1440,7 @@ class ImageViewer(QWidget):
             Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE,
             Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
         }
-        if self._shift_held and self._temp and tool in snapping_tools:
+        if self._shift_pressed() and self._temp and tool in snapping_tools:
             img_pos = self._apply_snap(img_pos)
 
         img_pt = Point(img_pos.x(), img_pos.y())
@@ -1002,6 +1547,49 @@ class ImageViewer(QWidget):
         self.update()
 
     # ------------------------------------------------------------------
+    # Box select (SELECT tool)
+    # ------------------------------------------------------------------
+
+    def _finish_box_select(self, end_screen: QPointF):
+        if self._box_sel_start is None:
+            return
+        start = self._box_sel_start
+        self._box_sel_start = None
+
+        rect_screen = QRectF(start, end_screen).normalized()
+        # If the user merely clicked (no real drag), clear selection
+        if rect_screen.width() < _DRAG_THRESH and rect_screen.height() < _DRAG_THRESH:
+            if not self._box_sel_additive:
+                self._selection = set()
+                self.selection_changed.emit([])
+            self._box_sel_base = set()
+            self.update()
+            return
+
+        # Build the image-space rect for vertex containment test
+        img_tl = self._screen_to_img(rect_screen.topLeft())
+        img_br = self._screen_to_img(rect_screen.bottomRight())
+        x_min, x_max = sorted((img_tl.x(), img_br.x()))
+        y_min, y_max = sorted((img_tl.y(), img_br.y()))
+
+        picked: set = set()
+        for i, obj in enumerate(self.objects):
+            for px, py in obj.points:
+                if x_min <= px <= x_max and y_min <= py <= y_max:
+                    picked.add(i)
+                    break
+
+        if self._box_sel_additive:
+            new_sel = set(self._box_sel_base) | picked
+        else:
+            new_sel = picked
+
+        self._selection = new_sel
+        self._box_sel_base = set()
+        self.selection_changed.emit(sorted(self._selection))
+        self.update()
+
+    # ------------------------------------------------------------------
     # PAN-mode context menu
     # ------------------------------------------------------------------
 
@@ -1044,9 +1632,11 @@ class ImageViewer(QWidget):
         cut_a   = menu.addAction("Cut",   self.cut_selection)
         copy_a  = menu.addAction("Copy",  self.copy_selection)
         paste_a = menu.addAction("Paste", lambda: self.paste(screen_pos))
+        dup_a   = menu.addAction("Duplicate", lambda: self.duplicate_selection())
         cut_a.setEnabled(bool(sel))
         copy_a.setEnabled(bool(sel))
         paste_a.setEnabled(bool(self._clipboard))
+        dup_a.setEnabled(bool(sel))
 
         if sel:
             menu.addSeparator()
@@ -1120,6 +1710,8 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def _hit_object(self, screen_pos: QPointF) -> int:
+        if not self._show_objects:
+            return -1
         for i in range(len(self.objects) - 1, -1, -1):
             if self._obj_hit(self.objects[i], screen_pos):
                 return i
@@ -1168,6 +1760,8 @@ class ImageViewer(QWidget):
 
     def _hit_selected_vertex(self, screen_pos: QPointF) -> Tuple[int, int]:
         """Return (obj_idx, vtx_idx) for the first vertex handle hit among selected non-point objects."""
+        if not self._show_objects:
+            return -1, -1
         for i in self._selection:
             obj = self.objects[i]
             if obj.kind == "point":
@@ -1229,10 +1823,13 @@ class ImageViewer(QWidget):
     def _recalculate_object(self, obj: DiagramObject):
         pts = [Point(x, y) for x, y in obj.points]
         sf  = self.scale_info.scale_factor
+        unit = self.scale_info.unit
         if obj.kind == "distance" and len(pts) == 2:
             obj.value = pts[0].distance_to(pts[1]) * sf
+            obj.unit = unit
         elif obj.kind == "polyline" and len(pts) >= 2:
             obj.value = sum(pts[i].distance_to(pts[i + 1]) for i in range(len(pts) - 1)) * sf
+            obj.unit = unit
         elif obj.kind == "angle" and len(pts) == 3:
             p1, v, p2 = pts
             v1x, v1y = p1.x - v.x, p1.y - v.y
@@ -1240,10 +1837,12 @@ class ImageViewer(QWidget):
             dot = v1x * v2x + v1y * v2y
             mag = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
             obj.value = math.degrees(math.acos(max(-1.0, min(1.0, dot / mag)))) if mag > 0 else 0.0
+            obj.unit = "°"
         elif obj.kind == "area" and len(pts) >= 3:
             n = len(pts)
             area = sum(pts[i].x * pts[(i+1)%n].y - pts[(i+1)%n].x * pts[i].y for i in range(n))
             obj.value = abs(area) / 2.0 * (sf ** 2)
+            obj.unit = unit
 
     def _recalculate_all(self):
         for obj in self.objects:
@@ -1473,6 +2072,50 @@ class ImageViewer(QWidget):
     # Session
     # ------------------------------------------------------------------
 
+    def reset_session(self):
+        """Clear the active tab's session state: objects, selection, scale, origin, history."""
+        if self._active is None:
+            return
+        self.objects.clear()
+        self._selection.clear()
+        self._temp.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.origin        = Point(0.0, 0.0)
+        self._origin_world = (0.0, 0.0)
+        self.scale_info    = ScaleInfo(1.0, 1.0, "px")
+        self._cancel_transient_interactions()
+        self.set_current_tab_session_path(None)
+        self.selection_changed.emit([])
+        self.scale_set.emit(self.scale_info)
+        self.origin_set.emit(self.origin)
+        self.objects_changed.emit()
+        self.update()
+
+    def has_session_state(self) -> bool:
+        """Return True if the active tab has any annotation / scale / origin worth preserving."""
+        if self._active is None:
+            return False
+        return self._tab_has_session_state(self._active)
+
+    @staticmethod
+    def _tab_has_session_state(tab: DocumentTab) -> bool:
+        if tab.objects:
+            return True
+        if tab.origin_world != (0.0, 0.0):
+            return True
+        if tab.origin.x != 0.0 or tab.origin.y != 0.0:
+            return True
+        si = tab.scale_info
+        if si.unit != "px" or si.pixel_distance != 1.0 or si.real_distance != 1.0:
+            return True
+        return False
+
+    def tab_has_session_state(self, idx: int) -> bool:
+        if 0 <= idx < len(self._tabs):
+            return self._tab_has_session_state(self._tabs[idx])
+        return False
+
     def session_data(self) -> dict:
         return {
             "scale_info":   self.scale_info.to_dict(),
@@ -1481,23 +2124,38 @@ class ImageViewer(QWidget):
             "objects":      [o.to_dict() for o in self.objects],
         }
 
-    def load_session(self, data: dict):
+    def load_session(self, data: dict, progress=None):
+        """Load a session. Optional `progress(current, total)` callback."""
         self.scale_info    = ScaleInfo.from_dict(data["scale_info"])
         self.origin        = Point.from_dict(data["origin"])
         ow                 = data.get("origin_world", [0.0, 0.0])
         self._origin_world = (float(ow[0]), float(ow[1]))
 
         if "objects" in data:
-            self.objects = [DiagramObject.from_dict(o) for o in data["objects"]]
-        else:
+            raw = data["objects"]
+            total = len(raw)
             self.objects = []
-            for p in data.get("points", []):
+            for i, o in enumerate(raw):
+                self.objects.append(DiagramObject.from_dict(o))
+                if progress is not None and (i % 25 == 0 or i == total - 1):
+                    progress(i + 1, total)
+        else:
+            raw_pts = data.get("points", [])
+            raw_ms  = data.get("measurements", [])
+            total = len(raw_pts) + len(raw_ms)
+            self.objects = []
+            for i, p in enumerate(raw_pts):
                 self.objects.append(DiagramObject(
                     kind="point", name=p.get("label", ""),
                     points=[[p["x"], p["y"]]],
                 ))
-            for m in data.get("measurements", []):
+                if progress is not None and (i % 25 == 0 or i == total - 1):
+                    progress(i + 1, total)
+            for j, m in enumerate(raw_ms):
                 self.objects.append(DiagramObject.from_dict(m))
+                idx = len(raw_pts) + j
+                if progress is not None and (idx % 25 == 0 or idx == total - 1):
+                    progress(idx + 1, total)
 
         self._temp.clear()
         self._selection.clear()
