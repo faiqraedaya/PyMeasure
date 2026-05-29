@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.constants import Tool, TOOL_HELP, TOOL_LABELS, TOOL_SHORTCUTS
-from .dialogs import ExportDialog
+from ..core.prefs import PREFS
+from .dialogs import ExportDialog, PreferencesDialog
 from ..core.models import DiagramObject, Point, ScaleInfo
 from .panel import LeftPanel, RightPanel
 from .viewer import ImageViewer
@@ -26,12 +27,15 @@ class MainWindow(QMainWindow):
         self.viewer      = ImageViewer()
         self.right_panel = RightPanel()
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.left_panel)
-        splitter.addWidget(self.viewer)
-        splitter.addWidget(self.right_panel)
-        splitter.setSizes([210, 980, 260])
-        self.setCentralWidget(splitter)
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.addWidget(self.left_panel)
+        self._splitter.addWidget(self.viewer)
+        self._splitter.addWidget(self.right_panel)
+        self._splitter.setSizes([210, 980, 260])
+        self.setCentralWidget(self._splitter)
+
+        # Load display preferences before building the UI so labels format right.
+        self._load_display_prefs(QSettings("PyMeasure", "PyMeasure"))
 
         self._build_menus()
         self._build_status_bar()
@@ -70,6 +74,7 @@ class MainWindow(QMainWindow):
         self._update_recent_menu()
         self._update_recent_session_menu()
         self._refresh_ui_for_active_tab()
+        self._restore_window_state(settings)
 
     # ------------------------------------------------------------------
     # Menus
@@ -88,7 +93,8 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "&Load Session…",    "Ctrl+Shift+O", self.load_session)
         self._recent_session_menu = file_menu.addMenu("Load &Recent Session")
         file_menu.addSeparator()
-        self._add_action(file_menu, "&Export…",       "Ctrl+E",        self.show_export)
+        self._add_action(file_menu, "&Export…",         "Ctrl+E",       self.show_export)
+        self._add_action(file_menu, "Export &Image…",   "Ctrl+Shift+E", self.export_image)
         file_menu.addSeparator()
         self._add_action(file_menu, "&Quit",          "Ctrl+Q",        self.close)
 
@@ -105,6 +111,8 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "&Delete Selected", "Del",         self._on_delete_selected)
         edit_menu.addSeparator()
         self._add_action(edit_menu, "Clear &All",     None,            self._on_clear_all)
+        edit_menu.addSeparator()
+        self._add_action(edit_menu, "&Preferences…",  None,            self.show_preferences)
 
         # View
         view_menu = mb.addMenu("&View")
@@ -120,6 +128,19 @@ class MainWindow(QMainWindow):
         self._show_objects_act.setShortcut(QKeySequence("Ctrl+H"))
         self._show_objects_act.toggled.connect(self.viewer.set_objects_visible)
         view_menu.addAction(self._show_objects_act)
+
+        self._scale_bar_act = QAction("Show Scale &Bar", self)
+        self._scale_bar_act.setCheckable(True)
+        self._scale_bar_act.setChecked(self.viewer.scale_bar_visible)
+        self._scale_bar_act.toggled.connect(self.viewer.set_scale_bar_visible)
+        view_menu.addAction(self._scale_bar_act)
+
+        self._snap_act = QAction("Snap to &Vertices", self)
+        self._snap_act.setCheckable(True)
+        self._snap_act.setChecked(self.viewer.vertex_snap_enabled)
+        self._snap_act.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        self._snap_act.toggled.connect(self.viewer.set_vertex_snap)
+        view_menu.addAction(self._snap_act)
 
         # Tools
         tools_menu = mb.addMenu("&Tools")
@@ -423,7 +444,9 @@ class MainWindow(QMainWindow):
 
     @Slot(float, float)
     def _on_mouse_pos(self, wx: float, wy: float):
-        self._status_coords.setText(f"x: {wx:.4f}  y: {wy:.4f}")
+        self._status_coords.setText(
+            f"x: {PREFS.fmt_coord(wx)}  y: {PREFS.fmt_coord(wy)}"
+        )
 
     @Slot(float)
     def _on_zoom_changed(self, zoom: float):
@@ -446,21 +469,41 @@ class MainWindow(QMainWindow):
             if item:
                 item.setSelected(True)
         self._syncing_selection = False
+        self._update_totals()
+
+    def _update_totals(self):
+        """Refresh the takeoff summary (counts + Σ length / Σ area) in the panel."""
+        objs = self.viewer.objects
+        if not objs:
+            self.right_panel.totals_lbl.setText("No objects")
+            return
+        unit = self.viewer.scale_info.unit
+        counts: dict[str, int] = {}
+        total_len = total_area = 0.0
+        for o in objs:
+            counts[o.kind] = counts.get(o.kind, 0) + 1
+            if o.kind in ("distance", "polyline"):
+                total_len += o.value
+            elif o.kind == "area":
+                total_area += o.value
+        order = ["point", "distance", "polyline", "angle", "area"]
+        parts = [f"{counts[k]} {k}{'s' if counts[k] > 1 else ''}"
+                 for k in order if k in counts]
+        summary = f"{len(objs)} objects · " + ", ".join(parts)
+        if total_len:
+            summary += f"\nΣ length: {PREFS.fmt_value(total_len)} {unit}"
+        if total_area:
+            summary += f"\nΣ area: {PREFS.fmt_value(total_area)} {unit}²"
+        self.right_panel.totals_lbl.setText(summary)
 
     def _object_list_label(self, obj: DiagramObject) -> str:
-        icons = {"point": "●", "distance": "─ ", "angle": "∠ ", "area": "▣ ", "polyline": "〜 "}
-        icon = icons.get(obj.kind, "? ")
-        name = obj.name if obj.name else obj.kind.capitalize()
+        # Points show their live world coordinates; every other kind delegates to
+        # the model so the list, canvas and export share one formatting source.
         if obj.kind == "point" and obj.points:
+            name = obj.name or "Point"
             wx, wy = self.viewer.img_to_world(QPointF(*obj.points[0]))
-            return f"{icon}{name}  ({wx:.4f}, {wy:.4f})"
-        if obj.kind in ("distance", "polyline"):
-            return f"{icon}{name}: {obj.value:.4g} {obj.unit}"
-        if obj.kind == "angle":
-            return f"{icon}{name}: {obj.value:.2f}°"
-        if obj.kind == "area":
-            return f"{icon}{name}: {obj.value:.4g} {obj.unit}²"
-        return f"{icon}{name}"
+            return f"●{name}  ({PREFS.fmt_coord(wx)}, {PREFS.fmt_coord(wy)})"
+        return obj.list_label()
 
     # ------------------------------------------------------------------
     # Right-panel list context menu
@@ -664,6 +707,83 @@ class MainWindow(QMainWindow):
         to_world = lambda x, y: self.viewer.img_to_world(QPointF(x, y))
         ExportDialog(self.viewer.objects, to_world, self).exec()
 
+    def export_image(self):
+        if self.viewer.current_tab_index < 0:
+            QMessageBox.information(self, "Export Image", "Open an image or PDF first.")
+            return
+        img = self.viewer.render_annotated_image()
+        if img is None or img.isNull():
+            QMessageBox.warning(self, "Export Image", "Nothing to export.")
+            return
+        base = self.viewer.current_tab_file_path() or ""
+        suggested = (os.path.splitext(base)[0] + "_annotated.png") if base else ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Annotated Image", suggested,
+            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg)",
+        )
+        if not path:
+            return
+        if img.save(path):
+            self._status_msg.setText(f"Annotated image saved to {path}")
+        else:
+            QMessageBox.critical(self, "Export Image", f"Could not save image:\n{path}")
+
+    # ------------------------------------------------------------------
+    # Preferences
+    # ------------------------------------------------------------------
+
+    def show_preferences(self):
+        dlg = PreferencesDialog(PREFS, self)
+        if dlg.exec() != PreferencesDialog.DialogCode.Accepted:
+            return
+        PREFS.value_sig_figs, PREFS.coord_decimals, PREFS.angle_in_radians = dlg.values()
+        self._save_display_prefs(QSettings("PyMeasure", "PyMeasure"))
+        # Re-render everything that shows a formatted number.
+        self._rebuild_objects_list()
+        self._refresh_ui_for_active_tab()
+        self.viewer.update()
+
+    def _load_display_prefs(self, settings: QSettings):
+        PREFS.value_sig_figs = int(settings.value("display/valueSigFigs", PREFS.value_sig_figs))
+        PREFS.coord_decimals = int(settings.value("display/coordDecimals", PREFS.coord_decimals))
+        PREFS.angle_in_radians = settings.value(
+            "display/angleRadians", PREFS.angle_in_radians, type=bool
+        )
+
+    def _save_display_prefs(self, settings: QSettings):
+        settings.setValue("display/valueSigFigs", PREFS.value_sig_figs)
+        settings.setValue("display/coordDecimals", PREFS.coord_decimals)
+        settings.setValue("display/angleRadians", PREFS.angle_in_radians)
+
+    # ------------------------------------------------------------------
+    # Window state persistence
+    # ------------------------------------------------------------------
+
+    def _restore_window_state(self, settings: QSettings):
+        geom = settings.value("window/geometry")
+        if geom is not None:
+            self.restoreGeometry(geom)
+        split = settings.value("window/splitter")
+        if split is not None:
+            self._splitter.restoreState(split)
+        # View toggles — setChecked fires `toggled`, which applies to the viewer.
+        self._show_objects_act.setChecked(settings.value("view/showObjects", True, type=bool))
+        self._scale_bar_act.setChecked(settings.value("view/scaleBar", True, type=bool))
+        self._snap_act.setChecked(settings.value("view/snapVertices", True, type=bool))
+
+    def _save_window_state(self, settings: QSettings):
+        settings.setValue("window/geometry", self.saveGeometry())
+        settings.setValue("window/splitter", self._splitter.saveState())
+        settings.setValue("view/showObjects", self._show_objects_act.isChecked())
+        settings.setValue("view/scaleBar", self._scale_bar_act.isChecked())
+        settings.setValue("view/snapVertices", self._snap_act.isChecked())
+
+    def closeEvent(self, event):
+        settings = QSettings("PyMeasure", "PyMeasure")
+        self._save_window_state(settings)
+        self._save_display_prefs(settings)
+        super().closeEvent(event)
+
     def show_about(self):
         QMessageBox.about(
             self, "About PyMeasure",
@@ -677,9 +797,12 @@ class MainWindow(QMainWindow):
             "• Select, move, cut, copy, paste objects in Pan/Zoom mode<br>"
             "• Drag vertex handles directly when an object is selected<br>"
             "• Right-click a vertex to delete it · right-click an edge to insert<br>"
-            "• Shift-lock to cardinal directions while measuring<br>"
+            "• Shift-lock to cardinal directions · snap to existing vertices<br>"
             "• Double-click to finish area or polyline<br>"
-            "• Undo / Redo · save and load sessions · export CSV/JSON<br><br>"
+            "• Scale bar overlay · takeoff totals (Σ length / Σ area)<br>"
+            "• Configurable display precision and angle units (Preferences)<br>"
+            "• Undo / Redo · save and load sessions<br>"
+            "• Export CSV / JSON · export annotated image<br><br>"
             "Built with PySide6 and PyMuPDF.",
         )
 

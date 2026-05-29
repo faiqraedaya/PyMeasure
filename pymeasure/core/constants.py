@@ -54,5 +54,5 @@ TOOL_HELP = {
     Tool.ADD_LINE:           "Add Line — click 2 points to measure a straight line",
     Tool.ADD_ANGLE:          "Add Angle — click 3 points (middle point is the vertex)",
     Tool.ADD_AREA:           "Add Area — click vertices · double-click or right-click to close",
-    Tool.ADD_POLYLINE:       "Add Polyline — click vertices · double-click or right-click to finish",
+    Tool.ADD_POLYLINE:       "Add Polyline — click vertices · double-click to finish · right-click to undo last vertex",
 }

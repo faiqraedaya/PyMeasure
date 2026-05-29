@@ -8,7 +8,9 @@ A desktop GUI for making precise measurements on images and PDFs — set a real-
 - Set coordinate origin and scale by known distance or known point coordinates
 - Add labelled points, lines, angles, areas, and polylines
 - Select, move, cut, copy, and paste objects with individual vertex handles
-- Export results to CSV, JSON, or clipboard; save and reload full sessions
+- Snap to existing vertices while measuring; on-canvas scale bar overlay
+- Live takeoff totals (Σ length / Σ area) and configurable display precision
+- Export results to CSV, JSON, clipboard, or an annotated image; save and reload full sessions
 
 ## Installation
 

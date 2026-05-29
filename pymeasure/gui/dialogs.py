@@ -4,13 +4,14 @@ import json
 from typing import List, Tuple
 
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QMessageBox, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..core.models import DiagramObject, Point
+from ..core.prefs import DisplayPrefs
 
 
 class ScaleDistanceDialog(QDialog):
@@ -232,6 +233,47 @@ class EditObjectDialog(QDialog):
                 wx, wy = 0.0, 0.0
             pts.append((wx, wy))
         return name, pts
+
+
+class PreferencesDialog(QDialog):
+    """Edit display preferences: number formatting and angle units."""
+
+    def __init__(self, prefs: DisplayPrefs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+
+        form = QFormLayout()
+        self.sig_figs = QSpinBox()
+        self.sig_figs.setRange(1, 10)
+        self.sig_figs.setValue(prefs.value_sig_figs)
+        form.addRow("Value significant figures:", self.sig_figs)
+
+        self.coord_dec = QSpinBox()
+        self.coord_dec.setRange(0, 10)
+        self.coord_dec.setValue(prefs.coord_decimals)
+        form.addRow("Coordinate decimals:", self.coord_dec)
+
+        self.angle_unit = QComboBox()
+        self.angle_unit.addItems(["Degrees", "Radians"])
+        self.angle_unit.setCurrentIndex(1 if prefs.angle_in_radians else 0)
+        form.addRow("Angle unit:", self.angle_unit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def values(self) -> Tuple[int, int, bool]:
+        """Return (value_sig_figs, coord_decimals, angle_in_radians)."""
+        return (self.sig_figs.value(),
+                self.coord_dec.value(),
+                self.angle_unit.currentIndex() == 1)
 
 
 class ExportDialog(QDialog):

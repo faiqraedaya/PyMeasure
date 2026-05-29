@@ -2,6 +2,8 @@ import math
 from datetime import datetime
 from dataclasses import dataclass, field
 
+from .prefs import PREFS
+
 
 @dataclass
 class Point:
@@ -62,21 +64,21 @@ class DiagramObject:
         if self.kind == "point":
             return f"{icon}{name}"
         if self.kind in ("distance", "polyline"):
-            return f"{icon}{name}: {self.value:.4g} {self.unit}"
+            return f"{icon}{name}: {PREFS.fmt_value(self.value)} {self.unit}"
         if self.kind == "angle":
-            return f"{icon}{name}: {self.value:.2f}°"
+            return f"{icon}{name}: {PREFS.fmt_angle(self.value)}"
         if self.kind == "area":
-            return f"{icon}{name}: {self.value:.4g} {self.unit}²"
+            return f"{icon}{name}: {PREFS.fmt_value(self.value)} {self.unit}²"
         return f"{icon}{name}"
 
     def display_short(self) -> str:
         """Compact value label drawn on the canvas."""
         if self.kind in ("distance", "polyline"):
-            return f"{self.value:.4g} {self.unit}"
+            return f"{PREFS.fmt_value(self.value)} {self.unit}"
         if self.kind == "area":
-            return f"{self.value:.4g} {self.unit}²"
+            return f"{PREFS.fmt_value(self.value)} {self.unit}²"
         if self.kind == "angle":
-            return f"{self.value:.2f}°"
+            return PREFS.fmt_angle(self.value)
         return self.name
 
     def display(self) -> str:
@@ -84,14 +86,15 @@ class DiagramObject:
         ts = f"[{self.timestamp}] " if self.timestamp else ""
         name = self.name or self.kind.capitalize()
         if self.kind == "point":
-            c = f"({self.points[0][0]:.4f}, {self.points[0][1]:.4f})" if self.points else ""
+            c = (f"({PREFS.fmt_coord(self.points[0][0])}, "
+                 f"{PREFS.fmt_coord(self.points[0][1])})") if self.points else ""
             return f"{ts}{name} {c}".strip()
         if self.kind in ("distance", "polyline"):
-            return f"{ts}{name}: {self.value:.4f} {self.unit}"
+            return f"{ts}{name}: {PREFS.fmt_value(self.value)} {self.unit}"
         if self.kind == "area":
-            return f"{ts}{name}: {self.value:.4f} {self.unit}²"
+            return f"{ts}{name}: {PREFS.fmt_value(self.value)} {self.unit}²"
         if self.kind == "angle":
-            return f"{ts}{name}: {self.value:.2f}°"
+            return f"{ts}{name}: {PREFS.fmt_angle(self.value)}"
         return f"{ts}{name}: {self.value}"
 
     def to_dict(self) -> dict:

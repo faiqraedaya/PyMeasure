@@ -89,6 +89,11 @@ class RightPanel(QWidget):
         )
         obj_layout.addWidget(self.objects_list, 1)
 
+        self.totals_lbl = QLabel("No objects")
+        self.totals_lbl.setWordWrap(True)
+        self.totals_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        obj_layout.addWidget(self.totals_lbl)
+
         move_row = QHBoxLayout()
         self.move_up_btn   = QPushButton("Move Up")
         self.move_down_btn = QPushButton("Move Down")

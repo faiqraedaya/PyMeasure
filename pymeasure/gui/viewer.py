@@ -15,13 +15,18 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.constants import Tool
+from ..core.geometry import (
+    angle_deg, closest_point_on_segment, dist_point_to_segment, distance,
+    point_in_polygon, polygon_area, polyline_length, snap_to_cardinal,
+)
 from .dialogs import (
     EditObjectDialog, NameDialog, ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog,
 )
 from ..core.models import DiagramObject, Point, ScaleInfo
 
-_HIT_R      = 8   # hit-test radius in screen pixels
-_DRAG_THRESH = 4  # pixels before a press becomes a drag
+_HIT_R      = 8    # hit-test radius in screen pixels
+_DRAG_THRESH = 4   # pixels before a press becomes a drag
+_MAX_UNDO   = 100  # cap on undo history per tab to bound memory
 
 _KIND_COLOR = {
     "point":    QColor("#4488ff"),
@@ -33,50 +38,16 @@ _KIND_COLOR = {
 _SEL_COLOR   = QColor("#ff2222")
 _LABEL_COLOR = QColor("#dd0000")
 _PREVIEW_COLOR = QColor("#dd0000")
+_SNAP_COLOR  = QColor("#00e0ff")   # vertex-snap indicator
+
+# Tools that place geometry by clicking on the canvas (snap + preview apply).
+_PLACING_TOOLS = frozenset({
+    Tool.SET_ORIGIN, Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
+    Tool.ADD_POINT, Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE,
+})
 
 
-# ---------------------------------------------------------------------------
-# Geometry helpers
-# ---------------------------------------------------------------------------
-
-def _dist_pt_to_seg(px, py, ax, ay, bx, by) -> float:
-    dx, dy = bx - ax, by - ay
-    if dx == dy == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
-    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
-
-
-def _point_in_polygon(px, py, poly) -> bool:
-    n = len(poly)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        if ((yi > py) != (yj > py)) and px < (xj - xi) * (py - yi) / (yj - yi) + xi:
-            inside = not inside
-        j = i
-    return inside
-
-
-def _snap_cardinal(base: QPointF, pos: QPointF) -> QPointF:
-    dx = pos.x() - base.x()
-    dy = pos.y() - base.y()
-    angle = math.atan2(dy, dx)
-    snapped = round(angle / (math.pi / 2)) * (math.pi / 2)
-    dist = math.hypot(dx, dy)
-    return QPointF(base.x() + dist * math.cos(snapped), base.y() + dist * math.sin(snapped))
-
-
-def _seg_insert_point(screen_pos: QPointF, sa: QPointF, sb: QPointF) -> QPointF:
-    """Project screen_pos onto segment sa→sb and return the closest screen point."""
-    ax, ay = sa.x(), sa.y()
-    bx, by = sb.x(), sb.y()
-    dx, dy = bx - ax, by - ay
-    denom = dx * dx + dy * dy
-    t = max(0.0, min(1.0, ((screen_pos.x() - ax) * dx + (screen_pos.y() - ay) * dy) / denom)) if denom else 0.0
-    return QPointF(ax + t * dx, ay + t * dy)
+# Geometry / measurement maths live in core.geometry (Qt-free, unit-tested).
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +150,16 @@ class ImageViewer(QWidget):
 
         # View toggles
         self._show_objects = True
+        self._show_scale_bar = True
+
+        # Vertex snapping (object snap) while placing geometry.
+        self._snap_vertices = True
+        self._snap_indicator: Optional[Tuple[float, float]] = None  # img coords or None
+
+        # Cached canvas centre (screen px). Refreshed by _recompute_center on
+        # resize / tab change so the img<->screen transforms — called per vertex
+        # on every paint and hit-test — don't recompute width/height each time.
+        self._center: Tuple[float, float] = (0.0, 0.0)
 
         # Arrow-key nudge burst tracking
         self._nudge_burst_active = False
@@ -461,6 +442,7 @@ class ImageViewer(QWidget):
         self._box_sel_start = None
         self._box_sel_base = set()
         self._nudge_burst_active = False
+        self._snap_indicator = None
 
     def _on_tab_bar_current_changed(self, idx: int):
         if self._suppress_tab_signal:
@@ -494,8 +476,12 @@ class ImageViewer(QWidget):
         return max(0, self.height() - self._canvas_top())
 
     def _canvas_center(self) -> Tuple[float, float]:
+        return self._center
+
+    def _recompute_center(self):
+        """Cache the canvas centre. Call whenever size or tab-bar height changes."""
         top = self._canvas_top()
-        return self.width() / 2.0, top + (self.height() - top) / 2.0
+        self._center = (self.width() / 2.0, top + (self.height() - top) / 2.0)
 
     def _update_geometry(self):
         """Reposition the tab bar across the top of the viewer."""
@@ -505,6 +491,7 @@ class ImageViewer(QWidget):
             self._tab_bar.show()
         else:
             self._tab_bar.hide()
+        self._recompute_center()
 
     def resizeEvent(self, event):
         self._update_geometry()
@@ -529,6 +516,28 @@ class ImageViewer(QWidget):
         self.update()
 
     @property
+    def scale_bar_visible(self) -> bool:
+        return self._show_scale_bar
+
+    def set_scale_bar_visible(self, visible: bool):
+        if self._show_scale_bar == visible:
+            return
+        self._show_scale_bar = visible
+        self.update()
+
+    @property
+    def vertex_snap_enabled(self) -> bool:
+        return self._snap_vertices
+
+    def set_vertex_snap(self, enabled: bool):
+        if self._snap_vertices == enabled:
+            return
+        self._snap_vertices = enabled
+        if not enabled:
+            self._snap_indicator = None
+        self.update()
+
+    @property
     def current_page(self) -> int:
         return self._pdf_page_index
 
@@ -541,17 +550,19 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def _img_to_screen(self, img_pt: QPointF) -> QPointF:
-        cx, cy = self._canvas_center()
+        cx, cy = self._center
+        zoom, pan = self._zoom, self._pan
         return QPointF(
-            (img_pt.x() - self._pan.x()) * self._zoom + cx,
-            (img_pt.y() - self._pan.y()) * self._zoom + cy,
+            (img_pt.x() - pan.x()) * zoom + cx,
+            (img_pt.y() - pan.y()) * zoom + cy,
         )
 
     def _screen_to_img(self, screen_pt: QPointF) -> QPointF:
-        cx, cy = self._canvas_center()
+        cx, cy = self._center
+        zoom, pan = self._zoom, self._pan
         return QPointF(
-            (screen_pt.x() - cx) / self._zoom + self._pan.x(),
-            (screen_pt.y() - cy) / self._zoom + self._pan.y(),
+            (screen_pt.x() - cx) / zoom + pan.x(),
+            (screen_pt.y() - cy) / zoom + pan.y(),
         )
 
     def img_to_world(self, img_pt: QPointF) -> Tuple[float, float]:
@@ -623,11 +634,25 @@ class ImageViewer(QWidget):
         if self._pdf_doc is None:
             return False
         page = self._pdf_doc[self._pdf_page_index]
-        mat = fitz.Matrix(self._pdf_dpi / 72, self._pdf_dpi / 72)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        qimg = QImage.fromData(pix.tobytes("png"))
+        scale = self._pdf_dpi / 72
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+
+        # Build a QImage straight from the raw samples rather than round-tripping
+        # through a PNG encode + decode — noticeably faster on load and page
+        # switches. Fall back to PNG for unusual colorspaces.
+        fmt = {
+            1: QImage.Format.Format_Grayscale8,
+            3: QImage.Format.Format_RGB888,
+            4: QImage.Format.Format_RGBA8888,
+        }.get(pix.n)
+        if fmt is not None:
+            samples = pix.samples  # keep a reference alive for QImage's lifetime
+            qimg = QImage(samples, pix.width, pix.height, pix.stride, fmt)
+        else:
+            qimg = QImage.fromData(pix.tobytes("png"))
         if qimg.isNull():
             return False
+        # fromImage copies the pixels, so `samples` may be released afterwards.
         self._pixmap = QPixmap.fromImage(qimg)
         return True
 
@@ -755,8 +780,11 @@ class ImageViewer(QWidget):
         if self._show_objects:
             self._paint_objects(painter)
         self._paint_temp(painter)
+        self._paint_snap_indicator(painter)
         self._paint_zoom_rect(painter)
         self._paint_box_select(painter)
+        if self._show_scale_bar:
+            self._paint_scale_bar(painter, canvas_rect)
 
         painter.restore()
 
@@ -959,6 +987,98 @@ class ImageViewer(QWidget):
         painter.drawRect(rect)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
+    def _paint_snap_indicator(self, painter: QPainter):
+        if self._snap_indicator is None:
+            return
+        sp = self._img_to_screen(QPointF(self._snap_indicator[0], self._snap_indicator[1]))
+        r = 7.0
+        painter.setPen(QPen(_SNAP_COLOR, 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(sp, r, r)
+        painter.drawLine(QPointF(sp.x() - r - 3, sp.y()), QPointF(sp.x() + r + 3, sp.y()))
+        painter.drawLine(QPointF(sp.x(), sp.y() - r - 3), QPointF(sp.x(), sp.y() + r + 3))
+
+    @staticmethod
+    def _nice_length(raw: float) -> float:
+        """Round a length up/down to a 'nice' 1/2/5×10ⁿ value for the scale bar."""
+        if raw <= 0 or not math.isfinite(raw):
+            return 0.0
+        base = 10.0 ** math.floor(math.log10(raw))
+        f = raw / base
+        nice = 1.0 if f < 1.5 else 2.0 if f < 3.5 else 5.0 if f < 7.5 else 10.0
+        return nice * base
+
+    def _paint_scale_bar(self, painter: QPainter, area: QRectF):
+        """Draw a 'nice-number' scale bar in the bottom-left of `area`."""
+        if self._pixmap is None or self._zoom <= 0:
+            return
+        world_per_px = self.scale_info.scale_factor / self._zoom
+        if world_per_px <= 0 or not math.isfinite(world_per_px):
+            return
+        nice_world = self._nice_length(120.0 * world_per_px)   # ~120 px target
+        if nice_world <= 0:
+            return
+        bar_px = nice_world / world_per_px
+        if not math.isfinite(bar_px) or bar_px < 4 or bar_px > area.width():
+            return
+
+        label = f"{nice_world:g} {self.scale_info.unit}"
+        fm = painter.fontMetrics()
+        text_h = fm.height()
+        pad, tick, gap = 6.0, 4.0, 4.0
+        box_w = max(bar_px, fm.horizontalAdvance(label)) + pad * 2
+        box_h = pad + tick * 2 + gap + text_h + pad
+        box = QRectF(area.left() + 12.0, area.bottom() - 12.0 - box_h, box_w, box_h)
+
+        bg = QColor("#000000")
+        bg.setAlpha(120)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(box, 4, 4)
+
+        bar_y = box.top() + pad + tick
+        bar_x0 = box.left() + pad
+        bar_x1 = bar_x0 + bar_px
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.drawLine(QPointF(bar_x0, bar_y), QPointF(bar_x1, bar_y))
+        painter.drawLine(QPointF(bar_x0, bar_y - tick), QPointF(bar_x0, bar_y + tick))
+        painter.drawLine(QPointF(bar_x1, bar_y - tick), QPointF(bar_x1, bar_y + tick))
+        painter.drawText(QPointF(box.left() + pad, box.bottom() - pad), label)
+
+    def render_annotated_image(self) -> Optional[QImage]:
+        """Render the full-resolution image with origin, objects and scale bar
+        burned in, for exporting a snapshot. Returns None if no image is open."""
+        if self._pixmap is None:
+            return None
+        iw, ih = self._pixmap.width(), self._pixmap.height()
+        if iw <= 0 or ih <= 0:
+            return None
+
+        img = QImage(iw, ih, QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.white)
+
+        # Temporarily map image coords 1:1 to device pixels and hide selection
+        # (no highlight / vertex handles) while reusing the normal paint helpers.
+        saved = (self._center, self._zoom, self._pan, set(self._selection))
+        painter = QPainter(img)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.drawPixmap(0, 0, self._pixmap)
+            self._center = (0.0, 0.0)
+            self._zoom = 1.0
+            self._pan = QPointF(0.0, 0.0)
+            self._selection = set()
+            self._paint_origin(painter)
+            self._paint_objects(painter)
+            if self._show_scale_bar:
+                self._paint_scale_bar(painter, QRectF(0, 0, iw, ih))
+        finally:
+            painter.end()
+            self._center, self._zoom, self._pan, sel = saved
+            self._selection = sel
+        return img
+
     def _preview_screen_pt(self) -> Optional[QPointF]:
         if self._mouse_img is None or not self._temp:
             return None
@@ -970,9 +1090,36 @@ class ImageViewer(QWidget):
         )
 
     def _apply_snap(self, img_pos: QPointF) -> QPointF:
+        # Shift = cardinal lock (explicit) takes precedence over passive snapping.
         if self._shift_pressed() and self._temp:
-            return _snap_cardinal(QPointF(self._temp[-1].x, self._temp[-1].y), img_pos)
+            base = self._temp[-1]
+            sx, sy = snap_to_cardinal(base.x, base.y, img_pos.x(), img_pos.y())
+            return QPointF(sx, sy)
+        if self._snap_vertices:
+            v = self._nearest_vertex_img(img_pos)
+            if v is not None:
+                return QPointF(v[0], v[1])
         return img_pos
+
+    def _nearest_vertex_img(self, img_pos: QPointF) -> Optional[Tuple[float, float]]:
+        """Nearest existing object vertex within _HIT_R screen px, or None.
+
+        Used for object snapping while placing geometry so measurements can be
+        chained exactly off shared corners.
+        """
+        if not self.objects:
+            return None
+        sp = self._img_to_screen(img_pos)
+        best = None
+        best_d = float(_HIT_R)
+        for obj in self.objects:
+            for vx, vy in obj.points:
+                svp = self._img_to_screen(QPointF(vx, vy))
+                d = math.hypot(svp.x() - sp.x(), svp.y() - sp.y())
+                if d <= best_d:
+                    best_d = d
+                    best = (vx, vy)
+        return best
 
     # ------------------------------------------------------------------
     # Tool selection
@@ -987,6 +1134,7 @@ class ImageViewer(QWidget):
         self._zoom_rect_start = None
         self._box_sel_start   = None
         self._box_sel_base    = set()
+        self._snap_indicator  = None
         self.current_tool = tool
         self._temp.clear()
         self._update_cursor_for_pos()
@@ -1105,9 +1253,21 @@ class ImageViewer(QWidget):
             self.update()
             return
 
-        # Update hover cursor
+        # Track the vertex-snap target so the preview/click snap and the on-canvas
+        # indicator stay in sync while a placing tool is active.
+        placing = self.current_tool in _PLACING_TOOLS
+        if (placing and self._snap_vertices and self._mouse_img is not None
+                and not (self._shift_pressed() and self._temp)):
+            self._snap_indicator = self._nearest_vertex_img(self._mouse_img)
+        else:
+            self._snap_indicator = None
+
+        # Update hover cursor. Only force a repaint when something on the canvas
+        # actually follows the cursor (a measurement preview or a placing tool);
+        # a plain hover in pan/select changes nothing, so skip the repaint.
         self._update_cursor_for_pos(pos)
-        self.update()
+        if self._temp or placing:
+            self.update()
 
     def mouseReleaseEvent(self, event):
         btn = event.button()
@@ -1121,8 +1281,7 @@ class ImageViewer(QWidget):
             return
 
         if self._vtx_drag_active and btn == Qt.MouseButton.LeftButton:
-            self._undo_stack.append(self._vtx_drag_snap)
-            self._redo_stack.clear()
+            self._record_undo(self._vtx_drag_snap)
             self._recalculate_object(self.objects[self._vtx_drag_obj])
             self._vtx_drag_active = False
             self._vtx_drag_vtx    = -1
@@ -1134,8 +1293,7 @@ class ImageViewer(QWidget):
 
         if btn == Qt.MouseButton.LeftButton and self.current_tool in (Tool.PAN, Tool.SELECT):
             if self._sel_drag_active:
-                self._undo_stack.append(self._sel_drag_snap)
-                self._redo_stack.clear()
+                self._record_undo(self._sel_drag_snap)
                 self._sel_drag_active = False
                 self._sel_press_obj   = -1
                 self._sel_press_pos   = None
@@ -1433,16 +1591,10 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def _left_click(self, screen_pos: QPointF):
-        img_pos = self._screen_to_img(screen_pos)
-        tool    = self.current_tool
-
-        snapping_tools = {
-            Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE,
-            Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
-        }
-        if self._shift_pressed() and self._temp and tool in snapping_tools:
-            img_pos = self._apply_snap(img_pos)
-
+        tool = self.current_tool
+        # _left_click only fires for placing tools, so always run snapping
+        # (cardinal lock with Shift, plus passive vertex snapping).
+        img_pos = self._apply_snap(self._screen_to_img(screen_pos))
         img_pt = Point(img_pos.x(), img_pos.y())
 
         if tool == Tool.SET_ORIGIN:
@@ -1497,12 +1649,10 @@ class ImageViewer(QWidget):
             self._show_pan_context_menu(screen_pos)
             return
 
-        # Close area / finish polyline, or pop last temp point
+        # Close area on right-click; otherwise right-click removes the last
+        # placed vertex (polyline finishes via double-click instead).
         if tool == Tool.ADD_AREA and len(self._temp) >= 3:
             self._finish_area()
-            return
-        if tool == Tool.ADD_POLYLINE and len(self._temp) >= 2:
-            self._finish_polyline()
             return
         if self._temp:
             self._temp.pop()
@@ -1730,22 +1880,22 @@ class ImageViewer(QWidget):
         if obj.kind == "distance" and len(obj.points) == 2:
             s0 = self._img_to_screen(QPointF(*obj.points[0]))
             s1 = self._img_to_screen(QPointF(*obj.points[1]))
-            return _dist_pt_to_seg(sp.x(), sp.y(), s0.x(), s0.y(), s1.x(), s1.y()) <= _HIT_R
+            return dist_point_to_segment(sp.x(), sp.y(), s0.x(), s0.y(), s1.x(), s1.y()) <= _HIT_R
 
         if obj.kind == "angle" and len(obj.points) == 3:
             s = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-            d1 = _dist_pt_to_seg(sp.x(), sp.y(), s[0].x(), s[0].y(), s[1].x(), s[1].y())
-            d2 = _dist_pt_to_seg(sp.x(), sp.y(), s[2].x(), s[2].y(), s[1].x(), s[1].y())
+            d1 = dist_point_to_segment(sp.x(), sp.y(), s[0].x(), s[0].y(), s[1].x(), s[1].y())
+            d2 = dist_point_to_segment(sp.x(), sp.y(), s[2].x(), s[2].y(), s[1].x(), s[1].y())
             return min(d1, d2) <= _HIT_R
 
         if obj.kind == "area" and len(obj.points) >= 3:
-            if _point_in_polygon(px, py, obj.points):
+            if point_in_polygon(px, py, obj.points):
                 return True
             n = len(obj.points)
             for j in range(n):
                 sa = self._img_to_screen(QPointF(*obj.points[j]))
                 sb = self._img_to_screen(QPointF(*obj.points[(j + 1) % n]))
-                if _dist_pt_to_seg(sp.x(), sp.y(), sa.x(), sa.y(), sb.x(), sb.y()) <= _HIT_R:
+                if dist_point_to_segment(sp.x(), sp.y(), sa.x(), sa.y(), sb.x(), sb.y()) <= _HIT_R:
                     return True
 
         if obj.kind == "polyline" and len(obj.points) >= 2:
@@ -1753,7 +1903,7 @@ class ImageViewer(QWidget):
             for j in range(n - 1):
                 sa = self._img_to_screen(QPointF(*obj.points[j]))
                 sb = self._img_to_screen(QPointF(*obj.points[j + 1]))
-                if _dist_pt_to_seg(sp.x(), sp.y(), sa.x(), sa.y(), sb.x(), sb.y()) <= _HIT_R:
+                if dist_point_to_segment(sp.x(), sp.y(), sa.x(), sa.y(), sb.x(), sb.y()) <= _HIT_R:
                     return True
 
         return False
@@ -1783,11 +1933,12 @@ class ImageViewer(QWidget):
             for j in segs:
                 sa = self._img_to_screen(QPointF(*obj.points[j]))
                 sb = self._img_to_screen(QPointF(*obj.points[(j + 1) % n]))
-                d = _dist_pt_to_seg(screen_pos.x(), screen_pos.y(),
+                d = dist_point_to_segment(screen_pos.x(), screen_pos.y(),
                                     sa.x(), sa.y(), sb.x(), sb.y())
                 if d <= _HIT_R:
-                    img_sp = _seg_insert_point(screen_pos, sa, sb)
-                    return i, j, self._screen_to_img(img_sp)
+                    ix, iy = closest_point_on_segment(
+                        screen_pos.x(), screen_pos.y(), sa.x(), sa.y(), sb.x(), sb.y())
+                    return i, j, self._screen_to_img(QPointF(ix, iy))
         return -1, -1, QPointF()
 
     # ------------------------------------------------------------------
@@ -1821,27 +1972,21 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def _recalculate_object(self, obj: DiagramObject):
-        pts = [Point(x, y) for x, y in obj.points]
-        sf  = self.scale_info.scale_factor
+        pts  = obj.points          # [[x, y], ...] image coords
+        sf   = self.scale_info.scale_factor
         unit = self.scale_info.unit
         if obj.kind == "distance" and len(pts) == 2:
-            obj.value = pts[0].distance_to(pts[1]) * sf
+            (ax, ay), (bx, by) = pts
+            obj.value = distance(ax, ay, bx, by) * sf
             obj.unit = unit
         elif obj.kind == "polyline" and len(pts) >= 2:
-            obj.value = sum(pts[i].distance_to(pts[i + 1]) for i in range(len(pts) - 1)) * sf
+            obj.value = polyline_length(pts) * sf
             obj.unit = unit
         elif obj.kind == "angle" and len(pts) == 3:
-            p1, v, p2 = pts
-            v1x, v1y = p1.x - v.x, p1.y - v.y
-            v2x, v2y = p2.x - v.x, p2.y - v.y
-            dot = v1x * v2x + v1y * v2y
-            mag = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
-            obj.value = math.degrees(math.acos(max(-1.0, min(1.0, dot / mag)))) if mag > 0 else 0.0
+            obj.value = angle_deg(pts[0], pts[1], pts[2])
             obj.unit = "°"
         elif obj.kind == "area" and len(pts) >= 3:
-            n = len(pts)
-            area = sum(pts[i].x * pts[(i+1)%n].y - pts[(i+1)%n].x * pts[i].y for i in range(n))
-            obj.value = abs(area) / 2.0 * (sf ** 2)
+            obj.value = polygon_area(pts) * (sf ** 2)
             obj.unit = unit
 
     def _recalculate_all(self):
@@ -1869,44 +2014,35 @@ class ImageViewer(QWidget):
         unit = self.scale_info.unit
 
         if tool in (Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS):
-            d_px = math.hypot(cur.x() - last.x, cur.y() - last.y)
+            d_px = distance(last.x, last.y, cur.x(), cur.y())
             self.live_measure.emit(f"Dist: {d_px:.1f} px")
 
         elif tool == Tool.ADD_LINE:
-            d_px = math.hypot(cur.x() - last.x, cur.y() - last.y)
+            d_px = distance(last.x, last.y, cur.x(), cur.y())
             self.live_measure.emit(f"Dist: {d_px * sf:.4g} {unit}")
 
         elif tool == Tool.ADD_ANGLE:
             if len(self._temp) == 2:
                 p1, vertex = self._temp[0], self._temp[1]
-                v1x, v1y = p1.x - vertex.x, p1.y - vertex.y
-                v2x, v2y = cur.x() - vertex.x, cur.y() - vertex.y
-                dot = v1x * v2x + v1y * v2y
-                mag = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
-                angle = math.degrees(math.acos(max(-1.0, min(1.0, dot / mag)))) if mag > 0 else 0.0
+                angle = angle_deg((p1.x, p1.y), (vertex.x, vertex.y), (cur.x(), cur.y()))
                 self.live_measure.emit(f"Angle: {angle:.2f}°")
             else:
-                d_px = math.hypot(cur.x() - last.x, cur.y() - last.y)
+                d_px = distance(last.x, last.y, cur.x(), cur.y())
                 self.live_measure.emit(f"Dist: {d_px * sf:.4g} {unit}")
 
         elif tool == Tool.ADD_AREA:
             if len(self._temp) >= 2:
-                pts = [[p.x, p.y] for p in self._temp] + [[cur.x(), cur.y()]]
-                n = len(pts)
-                area = sum(pts[i][0] * pts[(i+1)%n][1] - pts[(i+1)%n][0] * pts[i][1]
-                           for i in range(n))
-                self.live_measure.emit(f"Area: {abs(area)/2.0 * (sf**2):.4g} {unit}²")
+                pts = [(p.x, p.y) for p in self._temp]
+                pts.append((cur.x(), cur.y()))
+                self.live_measure.emit(f"Area: {polygon_area(pts) * (sf ** 2):.4g} {unit}²")
             else:
-                d_px = math.hypot(cur.x() - last.x, cur.y() - last.y)
+                d_px = distance(last.x, last.y, cur.x(), cur.y())
                 self.live_measure.emit(f"Dist: {d_px * sf:.4g} {unit}")
 
         elif tool == Tool.ADD_POLYLINE:
-            all_pts = [[p.x, p.y] for p in self._temp] + [[cur.x(), cur.y()]]
-            total = sum(
-                math.hypot(all_pts[i+1][0] - all_pts[i][0], all_pts[i+1][1] - all_pts[i][1])
-                for i in range(len(all_pts) - 1)
-            )
-            self.live_measure.emit(f"Length: {total * sf:.4g} {unit}")
+            pts = [(p.x, p.y) for p in self._temp]
+            pts.append((cur.x(), cur.y()))
+            self.live_measure.emit(f"Length: {polyline_length(pts) * sf:.4g} {unit}")
 
     # ------------------------------------------------------------------
     # Finish helpers
@@ -1929,9 +2065,8 @@ class ImageViewer(QWidget):
         elif tool == Tool.SET_SCALE_COORDS:
             dlg = ScaleCoordsDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                import math as _m
                 (x1, y1, x2, y2), unit = dlg.values()
-                real_dist = _m.hypot(x2 - x1, y2 - y1)
+                real_dist = math.hypot(x2 - x1, y2 - y1)
                 self._push_undo()
                 self.scale_info = ScaleInfo(pixel_dist, real_dist, unit)
                 self._recalculate_all()
@@ -2039,9 +2174,16 @@ class ImageViewer(QWidget):
             ],
         }
 
-    def _push_undo(self):
-        self._undo_stack.append(self._snapshot())
+    def _record_undo(self, snap: dict):
+        """Append an undo snapshot, bound history size, and drop the redo stack."""
+        stack = self._undo_stack
+        stack.append(snap)
+        if len(stack) > _MAX_UNDO:
+            del stack[:len(stack) - _MAX_UNDO]
         self._redo_stack.clear()
+
+    def _push_undo(self):
+        self._record_undo(self._snapshot())
 
     def _restore(self, snap: dict):
         self.origin        = Point(*snap["origin"])
