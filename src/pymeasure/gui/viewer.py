@@ -6,17 +6,20 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 import fitz  # PyMuPDF
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal
+from PySide6.QtCore import Qt, QPointF, QRect, QRectF, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QImage, QPainter, QPen, QPixmap, QPolygonF,
+    QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QPixmap,
+    QPolygonF,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QMenu, QMessageBox, QSizePolicy, QTabBar, QWidget,
 )
 
 from ..core.constants import Tool
+from ..core import contours
 from .dialogs import (
-    EditObjectDialog, NameDialog, ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog,
+    ContourLevelsDialog, EditObjectDialog, LegendTitleDialog, NameDialog,
+    ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog,
 )
 from ..core.models import DiagramObject, Point, ScaleInfo
 
@@ -29,10 +32,13 @@ _KIND_COLOR = {
     "angle":    QColor("#ff8800"),
     "area":     QColor("#ff6699"),
     "polyline": QColor("#44ddaa"),
+    "polyline_contour": QColor("#999999"),
+    "point_contour":    QColor("#999999"),
 }
 _SEL_COLOR   = QColor("#ff2222")
 _LABEL_COLOR = QColor("#dd0000")
 _PREVIEW_COLOR = QColor("#dd0000")
+_SKELETON_COLOR = QColor("#aaaaaa")   # thin dashed defining geometry of contours
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,9 @@ class DocumentTab:
 
     undo_stack: List[dict] = field(default_factory=list)
     redo_stack: List[dict] = field(default_factory=list)
+
+    legend_title: str = "Legend"
+    legend_visible: bool = True
 
     session_path: Optional[str] = None
 
@@ -179,6 +188,12 @@ class ImageViewer(QWidget):
 
         # View toggles
         self._show_objects = True
+        self._show_labels = True
+
+        # Contour render cache (rebuilt only when the signature changes)
+        self._contour_cache: list = []
+        self._contour_cache_sig = None
+        self._legend_rect: Optional[QRectF] = None   # last drawn legend bounds (screen)
 
         # Arrow-key nudge burst tracking
         self._nudge_burst_active = False
@@ -327,6 +342,22 @@ class ImageViewer(QWidget):
     def _redo_stack(self, val):
         if self._active is not None:
             self._active.redo_stack = val
+
+    @property
+    def legend_title(self) -> str:
+        return self._active.legend_title if self._active else "Legend"
+    @legend_title.setter
+    def legend_title(self, val):
+        if self._active is not None:
+            self._active.legend_title = val
+
+    @property
+    def legend_visible(self) -> bool:
+        return self._active.legend_visible if self._active else True
+    @legend_visible.setter
+    def legend_visible(self, val):
+        if self._active is not None:
+            self._active.legend_visible = val
 
     # ------------------------------------------------------------------
     # Tab management
@@ -529,6 +560,31 @@ class ImageViewer(QWidget):
         self.update()
 
     @property
+    def labels_visible(self) -> bool:
+        return self._show_labels
+
+    def set_labels_visible(self, visible: bool):
+        if self._show_labels == visible:
+            return
+        self._show_labels = visible
+        self.update()
+
+    def set_legend_visible(self, visible: bool):
+        if self._active is None or self._active.legend_visible == visible:
+            return
+        self._active.legend_visible = visible
+        self.update()
+
+    def edit_legend_title(self):
+        if self._active is None:
+            return
+        dlg = LegendTitleDialog(self.legend_title, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._push_undo()
+            self.legend_title = dlg.title() or "Legend"
+            self.update()
+
+    @property
     def current_page(self) -> int:
         return self._pdf_page_index
 
@@ -671,6 +727,12 @@ class ImageViewer(QWidget):
         self.zoom_changed.emit(self._zoom)
         self.update()
 
+    def grab_canvas(self) -> QPixmap:
+        """Render the current canvas (image + annotations + contours + legend,
+        excluding the tab bar) to a pixmap — used for image export."""
+        top = self._canvas_top()
+        return self.grab(QRect(0, top, self.width(), self.height() - top))
+
     def _update_cursor_for_pos(self, screen_pos: Optional[QPointF] = None):
         """Set cursor based on tool and what is under screen_pos."""
         if self.current_tool == Tool.ZOOM_RECT:
@@ -735,7 +797,7 @@ class ImageViewer(QWidget):
 
         if self._pixmap is None:
             painter.setPen(QColor("#888888"))
-            msg = ("Open an image or PDF to get started"
+            msg = ("Welcome to PyMeasure!\nOpen an image or PDF to get started"
                    if self._active is None else "Loading…")
             painter.drawText(canvas_rect, Qt.AlignmentFlag.AlignCenter, msg)
             return
@@ -753,10 +815,14 @@ class ImageViewer(QWidget):
 
         self._paint_origin(painter)
         if self._show_objects:
+            self._paint_contours(painter)
             self._paint_objects(painter)
         self._paint_temp(painter)
         self._paint_zoom_rect(painter)
         self._paint_box_select(painter)
+
+        if self._show_objects:
+            self._paint_legend(painter)
 
         painter.restore()
 
@@ -770,7 +836,7 @@ class ImageViewer(QWidget):
     def _paint_objects(self, painter: QPainter):
         for i, obj in enumerate(self.objects):
             selected = i in self._selection
-            color    = _KIND_COLOR.get(obj.kind, QColor("white"))
+            color    = QColor(obj.color) if obj.color else _KIND_COLOR.get(obj.kind, QColor("white"))
 
             if obj.kind == "point":
                 self._paint_point(painter, obj, i, selected)
@@ -790,16 +856,25 @@ class ImageViewer(QWidget):
                 self._paint_polyline(painter, obj, color, selected)
                 if selected:
                     self._paint_vertex_handles(painter, obj.points)
+            elif obj.kind == "polyline_contour":
+                self._paint_contour_skeleton(painter, obj, selected, closed=False)
+                if selected:
+                    self._paint_vertex_handles(painter, obj.points)
+            elif obj.kind == "point_contour":
+                self._paint_contour_skeleton(painter, obj, selected, closed=False)
 
     def _paint_point(self, painter, obj, idx, selected):
         if not obj.points:
             return
         sp = self._img_to_screen(QPointF(*obj.points[0]))
-        fill_color = _SEL_COLOR if selected else _KIND_COLOR["point"]
+        base = QColor(obj.color) if obj.color else _KIND_COLOR["point"]
+        fill_color = _SEL_COLOR if selected else base
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(fill_color))
         painter.drawEllipse(sp, 5.0, 5.0)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        if not self._show_labels:
+            return
         label = obj.name or f"P{idx + 1}"
         painter.setPen(_LABEL_COLOR)
         painter.drawText(QPointF(sp.x() + 9, sp.y() - 7), label)
@@ -815,6 +890,8 @@ class ImageViewer(QWidget):
         sp1 = self._img_to_screen(QPointF(*obj.points[1]))
         painter.setPen(QPen(draw_color, 2))
         painter.drawLine(sp0, sp1)
+        if not self._show_labels:
+            return
         mid = QPointF((sp0.x() + sp1.x()) / 2, (sp0.y() + sp1.y()) / 2)
         painter.setPen(_LABEL_COLOR)
         label = obj.name or "Line"
@@ -828,6 +905,8 @@ class ImageViewer(QWidget):
         painter.setPen(QPen(draw_color, 2))
         painter.drawLine(sp[0], sp[1])
         painter.drawLine(sp[2], sp[1])
+        if not self._show_labels:
+            return
         painter.setPen(_LABEL_COLOR)
         label = obj.name or "Angle"
         painter.drawText(QPointF(sp[1].x() + 5, sp[1].y() - 5), f"{label}: {obj.display_short()}")
@@ -843,6 +922,8 @@ class ImageViewer(QWidget):
         painter.setPen(QPen(draw_color, 2))
         painter.drawPolygon(QPolygonF(sps))
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        if not self._show_labels:
+            return
         cx = sum(s.x() for s in sps) / len(sps)
         cy = sum(s.y() for s in sps) / len(sps)
         painter.setPen(_LABEL_COLOR)
@@ -857,10 +938,33 @@ class ImageViewer(QWidget):
         painter.setPen(QPen(draw_color, 2))
         for i in range(len(sps) - 1):
             painter.drawLine(sps[i], sps[i + 1])
+        if not self._show_labels:
+            return
         mid = sps[len(sps) // 2]
         painter.setPen(_LABEL_COLOR)
         label = obj.name or "Polyline"
         painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), f"{label}: {obj.display_short()}")
+
+    def _paint_contour_skeleton(self, painter, obj, selected, closed=False):
+        """Thin dashed defining geometry (polyline or single point) of a contour
+        object, so it is visible and selectable. The contour rings themselves are
+        drawn separately (merged) in _paint_contours."""
+        if not obj.points:
+            return
+        sps = [self._img_to_screen(QPointF(*p)) for p in obj.points]
+        color = _SEL_COLOR if selected else _SKELETON_COLOR
+        if obj.kind == "point_contour":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(sps[0], 4.0, 4.0)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        else:
+            painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
+            for i in range(len(sps) - 1):
+                painter.drawLine(sps[i], sps[i + 1])
+        if self._show_labels and obj.name:
+            painter.setPen(_LABEL_COLOR)
+            painter.drawText(QPointF(sps[0].x() + 7, sps[0].y() - 6), obj.name)
 
     def _paint_vertex_handles(self, painter: QPainter, points: list):
         painter.setPen(QPen(QColor("#00ff88"), 1))
@@ -918,7 +1022,7 @@ class ImageViewer(QWidget):
             for i, sp in enumerate(pts_screen):
                 painter.drawText(QPointF(sp.x() + 7, sp.y() - 4), str(i + 1))
 
-        elif tool == Tool.ADD_POLYLINE:
+        elif tool in (Tool.ADD_POLYLINE, Tool.ADD_POLYLINE_CONTOUR):
             painter.setPen(QPen(QColor("#44ddaa"), 2))
             for i in range(len(pts_screen) - 1):
                 painter.drawLine(pts_screen[i], pts_screen[i + 1])
@@ -958,6 +1062,108 @@ class ImageViewer(QWidget):
         painter.setBrush(QBrush(fill))
         painter.drawRect(rect)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    # ------------------------------------------------------------------
+    # Contours (merged buffers) + legend
+    # ------------------------------------------------------------------
+
+    def _contour_signature(self):
+        """Cheap signature of all contour geometry + levels + scale; used to
+        avoid recomputing shapely unions on every repaint."""
+        sig = [round(self.scale_info.scale_factor, 9)]
+        for obj in self.objects:
+            if not obj.is_contour:
+                continue
+            sig.append((
+                obj.kind,
+                tuple((round(x, 3), round(y, 3)) for x, y in obj.points),
+                tuple((str(l.get("reference", "")),
+                       round(float(l.get("distance", 0) or 0), 6),
+                       l.get("color", "")) for l in obj.levels),
+            ))
+        return tuple(sig)
+
+    def _contour_groups(self) -> list:
+        sig = self._contour_signature()
+        if sig != self._contour_cache_sig:
+            contour_objs = [o for o in self.objects if o.is_contour]
+            self._contour_cache = contours.build_contour_groups(
+                contour_objs, self.scale_info.scale_factor
+            )
+            self._contour_cache_sig = sig
+        return self._contour_cache
+
+    def _draw_ring(self, painter: QPainter, ring_pts: list):
+        poly = QPolygonF([self._img_to_screen(QPointF(x, y)) for x, y in ring_pts])
+        painter.drawPolyline(poly)
+
+    def _paint_contours(self, painter: QPainter):
+        groups = self._contour_groups()
+        if not groups:
+            return
+        painter.setBrush(Qt.BrushStyle.NoBrush)   # no fill, line only
+        for g in groups:
+            painter.setPen(QPen(QColor(g["color"]), 2))
+            for exterior, interiors in g["polygons"]:
+                self._draw_ring(painter, exterior)
+                for hole in interiors:
+                    self._draw_ring(painter, hole)
+
+    def _paint_legend(self, painter: QPainter):
+        self._legend_rect = None
+        if self._active is None or not self.legend_visible:
+            return
+        groups = self._contour_groups()
+        if not groups:
+            return
+
+        painter.save()
+        base_font = painter.font()
+        title_font = QFont(base_font)
+        title_font.setBold(True)
+        fm = QFontMetrics(base_font)
+        tfm = QFontMetrics(title_font)
+        line_h = fm.height() + 4
+        swatch_w = 26
+        gap = 6
+        pad = 8
+
+        title = self.legend_title or "Legend"
+        max_text = tfm.horizontalAdvance(title)
+        for g in groups:
+            max_text = max(max_text, swatch_w + gap + fm.horizontalAdvance(g["reference"]))
+
+        box_w = pad * 2 + max_text
+        box_h = pad * 2 + line_h * (len(groups) + 1)
+        margin = 12
+        x = self.width() - box_w - margin
+        y = self._canvas_top() + margin
+        rect = QRectF(x, y, box_w, box_h)
+        self._legend_rect = rect
+
+        bg = QColor("#ffffff")
+        bg.setAlpha(225)
+        painter.setPen(QPen(QColor("#333333"), 1))
+        painter.setBrush(QBrush(bg))
+        painter.drawRect(rect)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        content_x = x + pad
+        painter.setFont(title_font)
+        painter.setPen(QColor("#000000"))
+        painter.drawText(QPointF(content_x, y + pad + tfm.ascent()), title)
+
+        painter.setFont(base_font)
+        for idx, g in enumerate(groups, start=1):
+            line_top = y + pad + line_h * idx
+            painter.setPen(QPen(QColor(g["color"]), 3))
+            sw_y = line_top + fm.height() / 2.0
+            painter.drawLine(QPointF(content_x, sw_y),
+                             QPointF(content_x + swatch_w, sw_y))
+            painter.setPen(QColor("#000000"))
+            painter.drawText(QPointF(content_x + swatch_w + gap, line_top + fm.ascent()),
+                             g["reference"])
+        painter.restore()
 
     def _preview_screen_pt(self) -> Optional[QPointF]:
         if self._mouse_img is None or not self._temp:
@@ -1159,12 +1365,20 @@ class ImageViewer(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         tool = self.current_tool
+        # Double-click the on-canvas legend (in PAN/SELECT) to edit its title.
+        if tool in (Tool.PAN, Tool.SELECT) and self._show_objects \
+                and self._legend_rect is not None \
+                and self._legend_rect.contains(QPointF(event.position())):
+            self.edit_legend_title()
+            return
         # The first click of the double-click already added a point via mousePressEvent.
         # Finish with that point included.
         if tool == Tool.ADD_AREA and len(self._temp) >= 3:
             self._finish_area()
         elif tool == Tool.ADD_POLYLINE and len(self._temp) >= 2:
             self._finish_polyline()
+        elif tool == Tool.ADD_POLYLINE_CONTOUR and len(self._temp) >= 2:
+            self._finish_polyline_contour()
 
     def wheelEvent(self, event):
         if self._active is None:
@@ -1438,6 +1652,7 @@ class ImageViewer(QWidget):
 
         snapping_tools = {
             Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE,
+            Tool.ADD_POLYLINE_CONTOUR,
             Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
         }
         if self._shift_pressed() and self._temp and tool in snapping_tools:
@@ -1462,17 +1677,21 @@ class ImageViewer(QWidget):
             self.update()
 
         elif tool == Tool.ADD_POINT:
-            name = self._ask_object_name("point")
-            if name is None:
+            result = self._ask_name_and_color("point")
+            if result is None:
                 return
+            name, color = result
             self._push_undo()
             obj = DiagramObject(
-                kind="point", name=name,
+                kind="point", name=name, color=color,
                 points=[[img_pt.x, img_pt.y]],
             )
             self.objects.append(obj)
             self.objects_changed.emit()
             self.update()
+
+        elif tool == Tool.ADD_POINT_CONTOUR:
+            self._finish_point_contour(img_pt)
 
         elif tool == Tool.ADD_LINE:
             self._temp.append(img_pt)
@@ -1486,7 +1705,7 @@ class ImageViewer(QWidget):
                 self._finish_angle()
             self.update()
 
-        elif tool in (Tool.ADD_AREA, Tool.ADD_POLYLINE):
+        elif tool in (Tool.ADD_AREA, Tool.ADD_POLYLINE, Tool.ADD_POLYLINE_CONTOUR):
             self._temp.append(img_pt)
             self.update()
 
@@ -1503,6 +1722,9 @@ class ImageViewer(QWidget):
             return
         if tool == Tool.ADD_POLYLINE and len(self._temp) >= 2:
             self._finish_polyline()
+            return
+        if tool == Tool.ADD_POLYLINE_CONTOUR and len(self._temp) >= 2:
+            self._finish_polyline_contour()
             return
         if self._temp:
             self._temp.pop()
@@ -1690,15 +1912,23 @@ class ImageViewer(QWidget):
     def _open_edit_dialog(self, idx: int):
         obj = self.objects[idx]
         world_pts = [self.img_to_world(QPointF(*p)) for p in obj.points]
-        dlg = EditObjectDialog(obj.kind, obj.name, world_pts, self)
+        dlg = EditObjectDialog(
+            obj.kind, obj.name, world_pts,
+            color=obj.color, levels=obj.levels, unit=self.scale_info.unit,
+            parent=self,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_name, new_world_pts = dlg.values()
+        new_name, new_world_pts, new_color, new_levels = dlg.values()
         self._push_undo()
         obj.name   = new_name
         obj.points = [[*(self._world_to_img(wx, wy).toTuple())] for wx, wy in new_world_pts]
-        if obj.kind != "point":
-            self._recalculate_object(obj)
+        if obj.is_contour:
+            obj.levels = new_levels
+        else:
+            obj.color = new_color
+            if obj.kind != "point":
+                self._recalculate_object(obj)
         self.objects_changed.emit()
         self.update()
 
@@ -1723,7 +1953,7 @@ class ImageViewer(QWidget):
         img = self._screen_to_img(sp)
         px, py = img.x(), img.y()
 
-        if obj.kind == "point":
+        if obj.kind in ("point", "point_contour"):
             spt = self._img_to_screen(QPointF(*obj.points[0]))
             return math.hypot(spt.x() - sp.x(), spt.y() - sp.y()) <= _HIT_R
 
@@ -1748,7 +1978,7 @@ class ImageViewer(QWidget):
                 if _dist_pt_to_seg(sp.x(), sp.y(), sa.x(), sa.y(), sb.x(), sb.y()) <= _HIT_R:
                     return True
 
-        if obj.kind == "polyline" and len(obj.points) >= 2:
+        if obj.kind in ("polyline", "polyline_contour") and len(obj.points) >= 2:
             n = len(obj.points)
             for j in range(n - 1):
                 sa = self._img_to_screen(QPointF(*obj.points[j]))
@@ -1764,7 +1994,7 @@ class ImageViewer(QWidget):
             return -1, -1
         for i in self._selection:
             obj = self.objects[i]
-            if obj.kind == "point":
+            if obj.kind in ("point", "point_contour"):
                 continue
             for vi, (vx, vy) in enumerate(obj.points):
                 sp = self._img_to_screen(QPointF(vx, vy))
@@ -1776,7 +2006,7 @@ class ImageViewer(QWidget):
         """Return (obj_idx, edge_start_idx, img_insert_pt) for first edge hit among selected area/polyline objects."""
         for i in self._selection:
             obj = self.objects[i]
-            if obj.kind not in ("area", "polyline"):
+            if obj.kind not in ("area", "polyline", "polyline_contour"):
                 continue
             n = len(obj.points)
             segs = range(n) if obj.kind == "area" else range(n - 1)
@@ -1945,25 +2175,43 @@ class ImageViewer(QWidget):
         prefix = {
             "point": "P", "distance": "L", "angle": "A",
             "area": "Area", "polyline": "PL",
+            "polyline_contour": "PLC", "point_contour": "PtC",
         }.get(kind, kind.capitalize())
         count = sum(1 for o in self.objects if o.kind == kind) + 1
         return f"{prefix}{count}"
 
-    def _ask_object_name(self, kind: str) -> Optional[str]:
-        dlg = NameDialog(kind, self._default_object_name(kind), self)
+    def _ask_name_and_color(self, kind: str) -> Optional[Tuple[str, str]]:
+        default_color = _KIND_COLOR.get(kind, QColor("#ffffff")).name()
+        dlg = NameDialog(kind, self._default_object_name(kind), default_color, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self._temp.clear()
             self.update()
             return None
-        return dlg.label()
+        return dlg.label(), dlg.color()
+
+    def _ask_contour_levels(self, kind: str):
+        """Open the levels dialog for a freshly-placed contour. Returns
+        (name, levels) or None if cancelled."""
+        kind_label = "Polyline Contour" if kind == "polyline_contour" else "Point Contour"
+        dlg = ContourLevelsDialog(
+            kind_label, self.scale_info.unit, self._default_object_name(kind),
+            None, self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._temp.clear()
+            self.update()
+            return None
+        name, levels = dlg.values()
+        return name, levels
 
     def _finish_distance(self):
-        name = self._ask_object_name("distance")
-        if name is None:
+        result = self._ask_name_and_color("distance")
+        if result is None:
             return
+        name, color = result
         p0, p1 = self._temp[0], self._temp[1]
         obj = DiagramObject(
-            kind="distance", name=name,
+            kind="distance", name=name, color=color,
             points=[[p0.x, p0.y], [p1.x, p1.y]],
             unit=self.scale_info.unit,
         )
@@ -1975,11 +2223,12 @@ class ImageViewer(QWidget):
         self.update()
 
     def _finish_angle(self):
-        name = self._ask_object_name("angle")
-        if name is None:
+        result = self._ask_name_and_color("angle")
+        if result is None:
             return
+        name, color = result
         obj = DiagramObject(
-            kind="angle", name=name,
+            kind="angle", name=name, color=color,
             points=[[p.x, p.y] for p in self._temp],
             unit="°",
         )
@@ -1991,11 +2240,12 @@ class ImageViewer(QWidget):
         self.update()
 
     def _finish_area(self):
-        name = self._ask_object_name("area")
-        if name is None:
+        result = self._ask_name_and_color("area")
+        if result is None:
             return
+        name, color = result
         obj = DiagramObject(
-            kind="area", name=name,
+            kind="area", name=name, color=color,
             points=[[p.x, p.y] for p in self._temp],
             unit=self.scale_info.unit,
         )
@@ -2007,15 +2257,47 @@ class ImageViewer(QWidget):
         self.update()
 
     def _finish_polyline(self):
-        name = self._ask_object_name("polyline")
-        if name is None:
+        result = self._ask_name_and_color("polyline")
+        if result is None:
             return
+        name, color = result
         obj = DiagramObject(
-            kind="polyline", name=name,
+            kind="polyline", name=name, color=color,
             points=[[p.x, p.y] for p in self._temp],
             unit=self.scale_info.unit,
         )
         self._recalculate_object(obj)
+        self._push_undo()
+        self.objects.append(obj)
+        self.objects_changed.emit()
+        self._temp.clear()
+        self.update()
+
+    def _finish_polyline_contour(self):
+        pts = [[p.x, p.y] for p in self._temp]
+        result = self._ask_contour_levels("polyline_contour")
+        if result is None:
+            return
+        name, levels = result
+        obj = DiagramObject(
+            kind="polyline_contour", name=name, points=pts,
+            unit=self.scale_info.unit, levels=levels,
+        )
+        self._push_undo()
+        self.objects.append(obj)
+        self.objects_changed.emit()
+        self._temp.clear()
+        self.update()
+
+    def _finish_point_contour(self, img_pt: Point):
+        result = self._ask_contour_levels("point_contour")
+        if result is None:
+            return
+        name, levels = result
+        obj = DiagramObject(
+            kind="point_contour", name=name, points=[[img_pt.x, img_pt.y]],
+            unit=self.scale_info.unit, levels=levels,
+        )
         self._push_undo()
         self.objects.append(obj)
         self.objects_changed.emit()
@@ -2033,10 +2315,8 @@ class ImageViewer(QWidget):
             "scale_info":   (self.scale_info.pixel_distance,
                              self.scale_info.real_distance,
                              self.scale_info.unit),
-            "objects": [
-                (o.kind, o.name, [list(p) for p in o.points], o.unit, o.value, o.timestamp)
-                for o in self.objects
-            ],
+            "objects":      [deepcopy(o.to_dict()) for o in self.objects],
+            "legend_title": self.legend_title,
         }
 
     def _push_undo(self):
@@ -2047,10 +2327,8 @@ class ImageViewer(QWidget):
         self.origin        = Point(*snap["origin"])
         self._origin_world = snap.get("origin_world", (0.0, 0.0))
         self.scale_info    = ScaleInfo(*snap["scale_info"])
-        self.objects       = [
-            DiagramObject(kind, name, pts, unit, value, ts)
-            for kind, name, pts, unit, value, ts in snap["objects"]
-        ]
+        self.objects       = [DiagramObject.from_dict(d) for d in snap["objects"]]
+        self.legend_title  = snap.get("legend_title", "Legend")
         self._temp.clear()
         self._selection.clear()
         self.state_restored.emit()
@@ -2084,6 +2362,7 @@ class ImageViewer(QWidget):
         self.origin        = Point(0.0, 0.0)
         self._origin_world = (0.0, 0.0)
         self.scale_info    = ScaleInfo(1.0, 1.0, "px")
+        self.legend_title  = "Legend"
         self._cancel_transient_interactions()
         self.set_current_tab_session_path(None)
         self.selection_changed.emit([])
@@ -2122,6 +2401,7 @@ class ImageViewer(QWidget):
             "origin":       self.origin.to_dict(),
             "origin_world": list(self._origin_world),
             "objects":      [o.to_dict() for o in self.objects],
+            "legend_title": self.legend_title,
         }
 
     def load_session(self, data: dict, progress=None):
@@ -2130,6 +2410,7 @@ class ImageViewer(QWidget):
         self.origin        = Point.from_dict(data["origin"])
         ow                 = data.get("origin_world", [0.0, 0.0])
         self._origin_world = (float(ow[0]), float(ow[1]))
+        self.legend_title  = data.get("legend_title", "Legend")
 
         if "objects" in data:
             raw = data["objects"]

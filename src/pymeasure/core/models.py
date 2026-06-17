@@ -45,20 +45,39 @@ class ScaleInfo:
 
 @dataclass
 class DiagramObject:
-    """A persistent diagram annotation: point, distance, angle, or area."""
-    kind: str        # "point" | "distance" | "angle" | "area"
+    """A persistent diagram annotation: point, distance, angle, area, polyline,
+    or a risk contour (polyline_contour / point_contour)."""
+    kind: str        # "point" | "distance" | "angle" | "area" | "polyline" |
+                     # "polyline_contour" | "point_contour"
     name: str = ""
     points: list = field(default_factory=list)   # [[x, y], ...] image coords
     unit: str = "px"
     value: float = 0.0   # pre-computed measurement value; unused for points
     timestamp: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
+    # Contour levels: [{"reference": str, "distance": float, "color": "#rrggbb"}]
+    levels: list = field(default_factory=list)
+    # Per-object line color override for non-contour objects ("" = kind default)
+    color: str = ""
 
-    _ICONS = {"point": "●", "distance": "─ ", "angle": "∠ ", "area": "▣ ", "polyline": "〜 "}
+    _ICONS = {
+        "point": "●", "distance": "─ ", "angle": "∠ ", "area": "▣ ",
+        "polyline": "〜 ", "polyline_contour": "◠ ", "point_contour": "◎ ",
+    }
+
+    @property
+    def is_contour(self) -> bool:
+        return self.kind in ("polyline_contour", "point_contour")
+
+    def _levels_summary(self) -> str:
+        n = len(self.levels)
+        return f"{n} level{'s' if n != 1 else ''}"
 
     def list_label(self) -> str:
         """Short label for the objects panel list."""
         icon = self._ICONS.get(self.kind, "? ")
         name = self.name if self.name else self.kind.capitalize()
+        if self.is_contour:
+            return f"{icon}{name}: {self._levels_summary()}"
         if self.kind == "point":
             return f"{icon}{name}"
         if self.kind in ("distance", "polyline"):
@@ -83,6 +102,8 @@ class DiagramObject:
         """Full string for export / status bar."""
         ts = f"[{self.timestamp}] " if self.timestamp else ""
         name = self.name or self.kind.capitalize()
+        if self.is_contour:
+            return f"{ts}{name}: {self._levels_summary()}"
         if self.kind == "point":
             c = f"({self.points[0][0]:.4f}, {self.points[0][1]:.4f})" if self.points else ""
             return f"{ts}{name} {c}".strip()
@@ -102,6 +123,8 @@ class DiagramObject:
             "unit": self.unit,
             "value": self.value,
             "timestamp": self.timestamp,
+            "levels": self.levels,
+            "color": self.color,
         }
 
     @classmethod
@@ -113,4 +136,6 @@ class DiagramObject:
             unit=d.get("unit", "px"),
             value=d.get("value", 0.0),
             timestamp=d.get("timestamp", ""),
+            levels=d.get("levels", []),
+            color=d.get("color", ""),
         )

@@ -13,6 +13,8 @@ class Tool(Enum):
     ADD_ANGLE            = "add_angle"
     ADD_AREA             = "add_area"
     ADD_POLYLINE         = "add_polyline"
+    ADD_POLYLINE_CONTOUR = "add_polyline_contour"
+    ADD_POINT_CONTOUR    = "add_point_contour"
 
 
 TOOL_LABELS = {
@@ -27,6 +29,8 @@ TOOL_LABELS = {
     Tool.ADD_ANGLE:          "Add Angle",
     Tool.ADD_AREA:           "Add Area",
     Tool.ADD_POLYLINE:       "Add Polyline",
+    Tool.ADD_POLYLINE_CONTOUR: "Add Polyline Contour",
+    Tool.ADD_POINT_CONTOUR:    "Add Point Contour",
 }
 
 TOOL_SHORTCUTS = {
@@ -41,6 +45,8 @@ TOOL_SHORTCUTS = {
     Tool.ADD_ANGLE:          "G",
     Tool.ADD_AREA:           "A",
     Tool.ADD_POLYLINE:       "N",
+    Tool.ADD_POLYLINE_CONTOUR: "K",
+    Tool.ADD_POINT_CONTOUR:    "P",
 }
 
 TOOL_HELP = {
@@ -55,4 +61,6 @@ TOOL_HELP = {
     Tool.ADD_ANGLE:          "Add Angle — click 3 points (middle point is the vertex)",
     Tool.ADD_AREA:           "Add Area — click vertices · double-click or right-click to close",
     Tool.ADD_POLYLINE:       "Add Polyline — click vertices · double-click or right-click to finish",
+    Tool.ADD_POLYLINE_CONTOUR: "Add Polyline Contour — click vertices · double-click to finish · then define contour levels",
+    Tool.ADD_POINT_CONTOUR:    "Add Point Contour — click a point · then define contour levels",
 }

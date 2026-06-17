@@ -1,16 +1,221 @@
 import csv
 import io
 import json
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QApplication, QColorDialog, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from ..core.models import DiagramObject, Point
+
+# Default palette cycled when adding contour levels / picking object colors.
+_CONTOUR_PALETTE = [
+    "#ff0000", "#ff8800", "#ffdd00", "#00cc44",
+    "#0088ff", "#aa44ff", "#ff44aa", "#00cccc",
+]
+MAX_CONTOUR_LEVELS = 20
+
+
+class ColorButton(QPushButton):
+    """A push button that shows the current color as its background and opens a
+    color picker when clicked."""
+
+    def __init__(self, color="#ff0000", parent=None):
+        super().__init__(parent)
+        self._color = QColor(color)
+        self.setMinimumWidth(90)
+        self.clicked.connect(self._pick)
+        self._refresh()
+
+    def _refresh(self):
+        # Show the color as a small icon swatch (NOT a background stylesheet —
+        # a background-color stylesheet would be inherited by the QColorDialog
+        # opened as this button's child and tint the whole picker).
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#888888"), 1))
+        p.setBrush(QBrush(self._color))
+        p.drawRoundedRect(0, 0, 15, 15, 3, 3)
+        p.end()
+        self.setIcon(QIcon(pm))
+        self.setText(self._color.name())
+
+    def _pick(self):
+        c = QColorDialog.getColor(self._color, self.window(), "Select Color")
+        if c.isValid():
+            self._color = c
+            self._refresh()
+
+    def color_name(self) -> str:
+        return self._color.name()
+
+    def set_color(self, color):
+        self._color = QColor(color)
+        self._refresh()
+
+
+class ContourLevelsTable(QWidget):
+    """Reusable editor for a contour object's levels: a table of
+    (reference value, distance, color) rows, capped at MAX_CONTOUR_LEVELS."""
+
+    def __init__(self, unit="px", levels=None, parent=None):
+        super().__init__(parent)
+        self._unit = unit
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(
+            ["Reference value", f"Distance ({unit})", "Color"]
+        )
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        v.addWidget(self._table)
+
+        row = QHBoxLayout()
+        add_btn = QPushButton("Add Level")
+        rem_btn = QPushButton("Remove Last")
+        add_btn.clicked.connect(lambda: self.add_row())
+        rem_btn.clicked.connect(self.remove_last)
+        row.addWidget(add_btn)
+        row.addWidget(rem_btn)
+        row.addStretch()
+        v.addLayout(row)
+
+        if levels:
+            for lv in levels[:MAX_CONTOUR_LEVELS]:
+                self.add_row(lv.get("reference", ""), lv.get("distance", 0.0),
+                             lv.get("color"))
+        else:
+            self.add_row()
+
+    def add_row(self, reference="", distance=0.0, color=None):
+        n = self._table.rowCount()
+        if n >= MAX_CONTOUR_LEVELS:
+            return
+        if color is None:
+            color = _CONTOUR_PALETTE[n % len(_CONTOUR_PALETTE)]
+        self._table.insertRow(n)
+        self._table.setItem(n, 0, QTableWidgetItem(str(reference)))
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1e12)
+        spin.setDecimals(4)
+        spin.setValue(float(distance))
+        self._table.setCellWidget(n, 1, spin)
+        self._table.setCellWidget(n, 2, ColorButton(color))
+
+    def remove_last(self):
+        if self._table.rowCount() > 1:
+            self._table.removeRow(self._table.rowCount() - 1)
+
+    def levels(self) -> list:
+        out = []
+        for r in range(self._table.rowCount()):
+            ref_item = self._table.item(r, 0)
+            ref = ref_item.text().strip() if ref_item else ""
+            spin = self._table.cellWidget(r, 1)
+            dist = spin.value() if spin else 0.0
+            cbtn = self._table.cellWidget(r, 2)
+            color = cbtn.color_name() if cbtn else "#ff0000"
+            out.append({"reference": ref, "distance": dist, "color": color})
+        return out
+
+
+def levels_order_warning(levels) -> Optional[str]:
+    """Return a warning message if contour distances aren't non-decreasing down
+    the rows (each level should reach at least as far as the one above it), or
+    None if the ordering is fine. Rows with no distance are ignored."""
+    flagged = []
+    prev = None
+    for lv in levels:
+        dist = float(lv.get("distance", 0) or 0)
+        if dist <= 0:
+            continue
+        ref = lv.get("reference", "") or "(unnamed)"
+        if prev is not None and dist < prev[1]:
+            flagged.append(f"  • '{ref}' ({dist:g}) is closer than '{prev[0]}' ({prev[1]:g})")
+        prev = (ref, dist)
+    if not flagged:
+        return None
+    return (
+        "Contour distances usually increase as the reference level becomes less "
+        "severe (each row should reach at least as far as the row above). "
+        "These rows are closer than a preceding row:\n\n"
+        + "\n".join(flagged)
+        + "\n\nThe contour will still be created."
+    )
+
+
+class ContourLevelsDialog(QDialog):
+    """Name + levels editor shown after a contour's geometry is placed."""
+
+    def __init__(self, kind_label="Contour", unit="px", name="", levels=None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{kind_label} Levels")
+
+        layout = QVBoxLayout()
+        form = QFormLayout()
+        self.name_edit = QLineEdit(name)
+        form.addRow("Name:", self.name_edit)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel(
+            f"Contour levels (distance in {unit}; max {MAX_CONTOUR_LEVELS}):"
+        ))
+        self._levels = ContourLevelsTable(unit, levels)
+        layout.addWidget(self._levels)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(480, 360)
+
+    def accept(self):
+        warn = levels_order_warning(self._levels.levels())
+        if warn:
+            QMessageBox.warning(self, "Contour Levels", warn)
+        super().accept()
+
+    def values(self) -> Tuple[str, list]:
+        return self.name_edit.text().strip(), self._levels.levels()
+
+
+class LegendTitleDialog(QDialog):
+    """Edit the on-canvas legend title."""
+
+    def __init__(self, title="Legend", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Legend Title")
+        self.edit = QLineEdit(title)
+        self.edit.selectAll()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Legend title:"))
+        layout.addWidget(self.edit)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def title(self) -> str:
+        return self.edit.text().strip()
 
 
 class ScaleDistanceDialog(QDialog):
@@ -88,25 +293,34 @@ _KIND_DISPLAY = {
 
 
 class NameDialog(QDialog):
-    def __init__(self, kind: str = "point", default: str = "", parent=None):
+    def __init__(self, kind: str = "point", default: str = "",
+                 color: str = "", parent=None):
         super().__init__(parent)
         display = _KIND_DISPLAY.get(kind, kind.capitalize())
         self.setWindowTitle(f"Label {display}")
         self.edit = QLineEdit(default)
         self.edit.selectAll()
+
+        form = QFormLayout()
+        form.addRow(f"{display} label:", self.edit)
+        self._color_btn = ColorButton(color or "#ffffff")
+        form.addRow("Color:", self._color_btn)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout()
-        layout.addWidget(QLabel(f"{display} label:"))
-        layout.addWidget(self.edit)
+        layout.addLayout(form)
         layout.addWidget(buttons)
         self.setLayout(layout)
 
     def label(self) -> str:
         return self.edit.text()
+
+    def color(self) -> str:
+        return self._color_btn.color_name()
 
 
 class SetOriginDialog(QDialog):
@@ -147,7 +361,8 @@ class SetOriginDialog(QDialog):
 
 
 class EditObjectDialog(QDialog):
-    """Edit the name and world-coordinate vertices of any DiagramObject."""
+    """Edit the name, color, and world-coordinate vertices of a DiagramObject.
+    For contour objects, edits the name and contour levels instead."""
 
     _VERTEX_LABELS = {
         "distance": ["P1", "P2"],
@@ -155,18 +370,33 @@ class EditObjectDialog(QDialog):
         "polyline": [],   # dynamically numbered
     }
 
-    def __init__(self, kind: str, name: str, world_pts: list, parent=None):
+    def __init__(self, kind: str, name: str, world_pts: list, color: str = "",
+                 levels: list = None, unit: str = "px", parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Edit {kind.capitalize()}")
+        self.setWindowTitle(f"Edit {kind.replace('_', ' ').title()}")
         self._kind = kind
+        self._is_contour = kind in ("polyline_contour", "point_contour")
+        self._world_pts = list(world_pts)
         layout = QVBoxLayout()
 
         form = QFormLayout()
         self.name_edit = QLineEdit(name)
         form.addRow("Name:", self.name_edit)
+        self._color_btn = None
+        if not self._is_contour:
+            self._color_btn = ColorButton(color or "#ffffff")
+            form.addRow("Color:", self._color_btn)
         layout.addLayout(form)
 
-        if kind == "point":
+        self._levels = None
+        self._table = None
+        if self._is_contour:
+            layout.addWidget(QLabel(
+                f"Contour levels (distance in {unit}; max {MAX_CONTOUR_LEVELS}):"
+            ))
+            self._levels = ContourLevelsTable(unit, levels)
+            layout.addWidget(self._levels)
+        elif kind == "point":
             wx, wy = world_pts[0] if world_pts else (0.0, 0.0)
             self._wx = QDoubleSpinBox()
             self._wx.setRange(-1e12, 1e12); self._wx.setDecimals(6); self._wx.setValue(wx)
@@ -193,7 +423,7 @@ class EditObjectDialog(QDialog):
                 btn_row = QHBoxLayout()
                 add_btn = QPushButton("Add Vertex")
                 rem_btn = QPushButton("Remove Last")
-                add_btn.clicked.connect(self._add_row)
+                add_btn.clicked.connect(lambda: self._add_row())
                 rem_btn.clicked.connect(self._remove_row)
                 btn_row.addWidget(add_btn); btn_row.addWidget(rem_btn); btn_row.addStretch()
                 layout.addLayout(btn_row)
@@ -205,7 +435,14 @@ class EditObjectDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.setLayout(layout)
-        self.resize(360, 300 if kind == "point" else 360)
+        self.resize(420, 300 if kind == "point" else 380)
+
+    def accept(self):
+        if self._is_contour:
+            warn = levels_order_warning(self._levels.levels())
+            if warn:
+                QMessageBox.warning(self, "Contour Levels", warn)
+        super().accept()
 
     def _add_row(self):
         n = self._table.rowCount()
@@ -219,10 +456,15 @@ class EditObjectDialog(QDialog):
         if self._table.rowCount() > minimum:
             self._table.setRowCount(self._table.rowCount() - 1)
 
-    def values(self) -> Tuple[str, list]:
+    def values(self) -> Tuple[str, list, str, list]:
+        """Return (name, world_pts, color, levels)."""
         name = self.name_edit.text()
+        color = self._color_btn.color_name() if self._color_btn else ""
+
+        if self._is_contour:
+            return name, self._world_pts, color, self._levels.levels()
         if self._kind == "point":
-            return name, [(self._wx.value(), self._wy.value())]
+            return name, [(self._wx.value(), self._wy.value())], color, []
         pts = []
         for row in range(self._table.rowCount()):
             try:
@@ -231,12 +473,12 @@ class EditObjectDialog(QDialog):
             except (ValueError, AttributeError):
                 wx, wy = 0.0, 0.0
             pts.append((wx, wy))
-        return name, pts
+        return name, pts, color, []
 
 
 class ExportDialog(QDialog):
     _FIELDNAMES = ["type", "name", "value", "unit", "timestamp",
-                   "world_points", "image_points"]
+                   "levels", "world_points", "image_points"]
 
     def __init__(self, objects: List[DiagramObject], to_world=None, parent=None):
         super().__init__(parent)
@@ -274,12 +516,18 @@ class ExportDialog(QDialog):
         world_str = "; ".join(
             "({:.4f},{:.4f})".format(*self._to_world(x, y)) for x, y in obj.points
         )
+        levels_str = "; ".join(
+            f"{lv.get('reference','')}@{lv.get('distance',0)}{lv.get('color','')}"
+            for lv in obj.levels
+        )
+        has_value = obj.kind not in ("point", "polyline_contour", "point_contour")
         return {
             "type":         obj.kind,
             "name":         obj.name,
-            "value":        obj.value if obj.kind != "point" else "",
-            "unit":         obj.unit  if obj.kind != "point" else "",
+            "value":        obj.value if has_value else "",
+            "unit":         obj.unit  if has_value else "",
             "timestamp":    obj.timestamp,
+            "levels":       levels_str,
             "world_points": world_str,
             "image_points": img_str,
         }

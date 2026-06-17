@@ -1,10 +1,11 @@
 [project]
 name = "PyMeasure"
-version = "1.1.0"
+version = "2.0.0"
 requires-python = ">=3.13"
 dependencies = [
     "pymupdf>=1.27.2.3",
     "pyside6>=6.11.1",
+    "shapely>=2.0",
 ]
 
 [dependency-groups]

@@ -2,17 +2,18 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import Qt, QPointF, QSettings, Slot
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QPointF, QSettings, QSize, Slot
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QProgressDialog, QSizePolicy, QSplitter,
+    QProgressDialog, QSizePolicy, QSplitter, QToolBar,
 )
 
 from ..core.constants import Tool, TOOL_HELP, TOOL_LABELS, TOOL_SHORTCUTS
+from . import icons
 from .dialogs import ExportDialog
 from ..core.models import DiagramObject, Point, ScaleInfo
-from .panel import LeftPanel, RightPanel
+from .panel import RightPanel
 from .viewer import ImageViewer
 
 
@@ -22,18 +23,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PyMeasure")
         self.resize(1400, 800)
 
-        self.left_panel  = LeftPanel()
         self.viewer      = ImageViewer()
         self.right_panel = RightPanel()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.left_panel)
         splitter.addWidget(self.viewer)
         splitter.addWidget(self.right_panel)
-        splitter.setSizes([210, 980, 260])
+        splitter.setSizes([1140, 260])
+        splitter.setStretchFactor(0, 1)
         self.setCentralWidget(splitter)
 
         self._build_menus()
+        self._build_toolbar()
         self._build_status_bar()
         self._connect_signals()
 
@@ -42,6 +43,11 @@ class MainWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }
             QPushButton:checked { background-color: #0066cc; color: white; }
             QListWidget { font-size: 11px; }
+            QToolBar { spacing: 1px; padding: 2px; border: none; }
+            QToolBar::separator { width: 1px; background: #555; margin: 3px 5px; }
+            QToolButton { padding: 3px; border-radius: 3px; }
+            QToolButton:hover { background-color: #3a3a3a; }
+            QToolButton:checked { background-color: #0066cc; }
         """)
 
         self._set_tool(Tool.PAN)
@@ -88,7 +94,8 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "&Load Session…",    "Ctrl+Shift+O", self.load_session)
         self._recent_session_menu = file_menu.addMenu("Load &Recent Session")
         file_menu.addSeparator()
-        self._add_action(file_menu, "&Export…",       "Ctrl+E",        self.show_export)
+        self._add_action(file_menu, "&Export Data…",  "Ctrl+E",        self.show_export)
+        self._add_action(file_menu, "Export &View as Image…", "Ctrl+Shift+E", self.export_view_image)
         file_menu.addSeparator()
         self._add_action(file_menu, "&Quit",          "Ctrl+Q",        self.close)
 
@@ -121,6 +128,22 @@ class MainWindow(QMainWindow):
         self._show_objects_act.toggled.connect(self.viewer.set_objects_visible)
         view_menu.addAction(self._show_objects_act)
 
+        self._show_labels_act = QAction("Show &Labels", self)
+        self._show_labels_act.setCheckable(True)
+        self._show_labels_act.setChecked(True)
+        self._show_labels_act.setShortcut(QKeySequence("Ctrl+L"))
+        self._show_labels_act.toggled.connect(self.viewer.set_labels_visible)
+        view_menu.addAction(self._show_labels_act)
+
+        view_menu.addSeparator()
+        self._show_legend_act = QAction("Show Le&gend", self)
+        self._show_legend_act.setCheckable(True)
+        self._show_legend_act.setChecked(True)
+        self._show_legend_act.toggled.connect(self.viewer.set_legend_visible)
+        view_menu.addAction(self._show_legend_act)
+        self._add_action(view_menu, "Edit Legend &Title…", None,
+                         self.viewer.edit_legend_title)
+
         # Tools
         tools_menu = mb.addMenu("&Tools")
         for tool in Tool:
@@ -139,6 +162,67 @@ class MainWindow(QMainWindow):
             act.setShortcut(QKeySequence(shortcut))
         act.triggered.connect(lambda checked=False, s=slot: s())
         menu.addAction(act)
+
+    # ------------------------------------------------------------------
+    # Toolbar
+    # ------------------------------------------------------------------
+
+    def _build_toolbar(self):
+        tb = QToolBar("Main Toolbar", self)
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setIconSize(QSize(22, 22))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+        self._toolbar = tb
+
+        # File / document actions
+        open_act = tb.addAction(icons.action_icon("open"), "Open")
+        open_act.setToolTip("Open image or PDF  (Ctrl+O)")
+        open_act.triggered.connect(self.open_file)
+        save_act = tb.addAction(icons.action_icon("save"), "Save Session")
+        save_act.setToolTip("Save session  (Ctrl+S)")
+        save_act.triggered.connect(self.save_session)
+        export_act = tb.addAction(icons.action_icon("export"), "Export")
+        export_act.setToolTip("Export data  (Ctrl+E)")
+        export_act.triggered.connect(self.show_export)
+        tb.addSeparator()
+
+        # Tool actions — checkable and mutually exclusive
+        self._tool_actions: dict[Tool, QAction] = {}
+        self._tool_group = QActionGroup(self)
+        self._tool_group.setExclusive(True)
+
+        groups = [
+            [Tool.PAN, Tool.SELECT, Tool.ZOOM_RECT],
+            [Tool.SET_ORIGIN, Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS],
+            [Tool.ADD_POINT, Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE],
+            [Tool.ADD_POINT_CONTOUR, Tool.ADD_POLYLINE_CONTOUR],
+        ]
+        for gi, group in enumerate(groups):
+            for tool in group:
+                act = QAction(icons.tool_icon(tool), TOOL_LABELS[tool], self)
+                act.setCheckable(True)
+                act.setToolTip(f"{TOOL_LABELS[tool]}  ({TOOL_SHORTCUTS[tool]})")
+                act.triggered.connect(lambda checked, t=tool: self._set_tool(t))
+                self._tool_group.addAction(act)
+                tb.addAction(act)
+                self._tool_actions[tool] = act
+            if gi < len(groups) - 1:
+                tb.addSeparator()
+
+        # PDF navigation — hidden unless a multi-page PDF is active
+        self._pdf_sep = tb.addSeparator()
+        self._pdf_prev_act = tb.addAction(icons.action_icon("prev"), "Previous Page")
+        self._pdf_prev_act.triggered.connect(self._go_prev_page)
+        self._pdf_page_lbl = QLabel("1 / 1")
+        self._pdf_page_lbl.setStyleSheet("padding: 0 6px;")
+        self._pdf_page_lbl_act = tb.addWidget(self._pdf_page_lbl)
+        self._pdf_next_act = tb.addAction(icons.action_icon("next"), "Next Page")
+        self._pdf_next_act.triggered.connect(self._go_next_page)
+        for a in (self._pdf_sep, self._pdf_prev_act,
+                  self._pdf_page_lbl_act, self._pdf_next_act):
+            a.setVisible(False)
 
     def _update_recent_menu(self):
         self._recent_menu.clear()
@@ -312,29 +396,28 @@ class MainWindow(QMainWindow):
 
         if self.viewer.current_tab_index < 0:
             self.setWindowTitle("PyMeasure")
-            self.left_panel.scale_lbl.setText("Scale: 1 px/px")
-            self.left_panel.origin_lbl.setText("Origin: (0.00, 0.00)")
-            self.left_panel.zoom_lbl.setText("Zoom: 100%")
-            self.left_panel.pdf_box.setVisible(False)
+            self._status_scale.setText("Scale: 1 px = 1 px")
+            self._status_origin.setText("Origin: (0, 0)")
             self._status_zoom.setText("100%")
             self._status_msg.setText("")
+            self._update_pdf_nav()
             return
 
         tab_path = self.viewer.current_tab_file_path() or "Untitled"
         self.setWindowTitle(f"PyMeasure — {os.path.basename(tab_path)}")
 
         si = self.viewer.scale_info
-        self.left_panel.scale_lbl.setText(f"1 px = {si.scale_factor:.6g} {si.unit}")
+        self._status_scale.setText(f"Scale: 1 px = {si.scale_factor:.6g} {si.unit}")
 
-        o  = self.viewer.origin
         ox, oy = self.viewer._origin_world
-        self.left_panel.origin_lbl.setText(
-            f"Origin: img ({o.x:.1f}, {o.y:.1f})\n  world ({ox:.4g}, {oy:.4g})"
-        )
+        self._status_origin.setText(f"Origin: ({ox:.4g}, {oy:.4g})")
 
         pct = f"{self.viewer.zoom * 100:.0f}%"
-        self.left_panel.zoom_lbl.setText(f"Zoom: {pct}")
         self._status_zoom.setText(pct)
+
+        self._show_legend_act.blockSignals(True)
+        self._show_legend_act.setChecked(self.viewer.legend_visible)
+        self._show_legend_act.blockSignals(False)
 
         self._update_pdf_nav()
 
@@ -350,10 +433,16 @@ class MainWindow(QMainWindow):
         sb.addWidget(self._status_msg, 1)
 
         self._status_live   = QLabel("")
+        self._status_scale  = QLabel("Scale: 1 px = 1 px")
+        self._status_origin = QLabel("Origin: (0, 0)")
         self._status_coords = QLabel("x: —  y: —")
         self._status_zoom   = QLabel("100%")
 
         sb.addPermanentWidget(self._status_live)
+        sb.addPermanentWidget(QLabel(" | "))
+        sb.addPermanentWidget(self._status_scale)
+        sb.addPermanentWidget(QLabel(" | "))
+        sb.addPermanentWidget(self._status_origin)
         sb.addPermanentWidget(QLabel(" | "))
         sb.addPermanentWidget(self._status_coords)
         sb.addPermanentWidget(QLabel(" | "))
@@ -364,8 +453,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _connect_signals(self):
-        self.left_panel.tool_selected.connect(self._set_tool)
-
         self.viewer.scale_set.connect(self._on_scale_set)
         self.viewer.origin_set.connect(self._on_origin_set)
         self.viewer.mouse_world_pos.connect(self._on_mouse_pos)
@@ -386,9 +473,6 @@ class MainWindow(QMainWindow):
         self.right_panel.move_up_btn.clicked.connect(self.viewer.move_selected_up)
         self.right_panel.move_down_btn.clicked.connect(self.viewer.move_selected_down)
 
-        self.left_panel.prev_page_btn.clicked.connect(self._go_prev_page)
-        self.left_panel.next_page_btn.clicked.connect(self._go_next_page)
-
         self.viewer.tab_changed.connect(self._on_tab_changed)
         self.viewer.tab_close_requested.connect(self._on_tab_close_requested)
 
@@ -399,23 +483,22 @@ class MainWindow(QMainWindow):
     @Slot(Tool)
     def _set_tool(self, tool: Tool):
         self.viewer.set_tool(tool)
-        self.left_panel.select_tool(tool)
+        act = self._tool_actions.get(tool)
+        if act is not None and not act.isChecked():
+            act.setChecked(True)
         self._status_msg.setText(TOOL_HELP[tool])
 
     @Slot(ScaleInfo)
     def _on_scale_set(self, si: ScaleInfo):
         text = f"1 px = {si.scale_factor:.6g} {si.unit}"
-        self.left_panel.scale_lbl.setText(text)
+        self._status_scale.setText(f"Scale: {text}")
         self._status_msg.setText(f"Scale set: {text}")
         self._rebuild_objects_list()
 
     @Slot(Point)
     def _on_origin_set(self, pt: Point):
         ox, oy = self.viewer._origin_world
-        self.left_panel.origin_lbl.setText(
-            f"Origin: img ({pt.x:.1f}, {pt.y:.1f})\n"
-            f"  world ({ox:.4g}, {oy:.4g})"
-        )
+        self._status_origin.setText(f"Origin: ({ox:.4g}, {oy:.4g})")
         self._status_msg.setText(
             f"Origin set at img ({pt.x:.1f}, {pt.y:.1f}) = world ({ox:.4g}, {oy:.4g})"
         )
@@ -427,9 +510,7 @@ class MainWindow(QMainWindow):
 
     @Slot(float)
     def _on_zoom_changed(self, zoom: float):
-        pct = f"{zoom * 100:.0f}%"
-        self._status_zoom.setText(pct)
-        self.left_panel.zoom_lbl.setText(f"Zoom: {pct}")
+        self._status_zoom.setText(f"{zoom * 100:.0f}%")
 
     # ------------------------------------------------------------------
     # Objects list (unified)
@@ -448,9 +529,15 @@ class MainWindow(QMainWindow):
         self._syncing_selection = False
 
     def _object_list_label(self, obj: DiagramObject) -> str:
-        icons = {"point": "●", "distance": "─ ", "angle": "∠ ", "area": "▣ ", "polyline": "〜 "}
+        icons = {
+            "point": "●", "distance": "─ ", "angle": "∠ ", "area": "▣ ",
+            "polyline": "〜 ", "polyline_contour": "◠ ", "point_contour": "◎ ",
+        }
         icon = icons.get(obj.kind, "? ")
         name = obj.name if obj.name else obj.kind.capitalize()
+        if obj.is_contour:
+            n = len(obj.levels)
+            return f"{icon}{name}: {n} level{'s' if n != 1 else ''}"
         if obj.kind == "point" and obj.points:
             wx, wy = self.viewer.img_to_world(QPointF(*obj.points[0]))
             return f"{icon}{name}  ({wx:.4f}, {wy:.4f})"
@@ -605,9 +692,12 @@ class MainWindow(QMainWindow):
 
     def _update_pdf_nav(self):
         count = self.viewer.pdf_page_count
-        self.left_panel.pdf_box.setVisible(count > 1)
-        if count > 1:
-            self.left_panel.page_lbl.setText(f"{self.viewer.current_page + 1} / {count}")
+        multi = count > 1
+        for a in (self._pdf_sep, self._pdf_prev_act,
+                  self._pdf_page_lbl_act, self._pdf_next_act):
+            a.setVisible(multi)
+        if multi:
+            self._pdf_page_lbl.setText(f"{self.viewer.current_page + 1} / {count}")
 
     # ------------------------------------------------------------------
     # Session
@@ -664,6 +754,25 @@ class MainWindow(QMainWindow):
         to_world = lambda x, y: self.viewer.img_to_world(QPointF(x, y))
         ExportDialog(self.viewer.objects, to_world, self).exec()
 
+    def export_view_image(self):
+        if self.viewer.current_tab_index < 0:
+            QMessageBox.information(self, "Export View", "Open an image or PDF first.")
+            return
+        tab_path = self.viewer.current_tab_file_path()
+        base = os.path.splitext(os.path.basename(tab_path))[0] if tab_path else "view"
+        start = os.path.join(self._last_open_dir, f"{base}.png") if self._last_open_dir else f"{base}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export View as Image", start,
+            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;All Files (*)",
+        )
+        if not path:
+            return
+        pixmap = self.viewer.grab_canvas()
+        if pixmap.isNull() or not pixmap.save(path):
+            QMessageBox.critical(self, "Export View", f"Could not save image to:\n{path}")
+            return
+        self._status_msg.setText(f"View exported to {path}")
+
     def show_about(self):
         QMessageBox.about(
             self, "About PyMeasure",
@@ -673,6 +782,8 @@ class MainWindow(QMainWindow):
             "• Pan and zoom · middle-click or scroll · Zoom Rectangle (Z)<br>"
             "• Set origin and scale (by distance or coordinates)<br>"
             "• Add labelled points, lines, angles, areas, and polylines<br>"
+            "• Draw polyline / point risk contours with merged same-label levels<br>"
+            "• On-canvas legend (editable title) · toggle labels · per-object colors<br>"
             "• Annotations persist on canvas with labels<br>"
             "• Select, move, cut, copy, paste objects in Pan/Zoom mode<br>"
             "• Drag vertex handles directly when an object is selected<br>"

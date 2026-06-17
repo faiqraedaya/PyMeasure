@@ -8,6 +8,12 @@ labelled objects, and measure distances, angles, areas, and polyline lengths.
 - Open PNG, JPEG, BMP, TIFF images and multi-page PDFs
 - Set coordinate origin and scale (by known distance or known point coordinates)
 - Add labelled points, lines, angles, areas, and polylines
+- Draw **risk contours** around a polyline or point: each contour defines up to 20
+  levels (reference value, distance, color) and renders smooth rounded boundaries
+- Contours from different objects that share the same reference label and overlap
+  automatically merge into a single outer boundary
+- On-canvas **legend** (editable title) mapping each reference value to its color
+- Choose a color for any object; toggle the visibility of text labels
 - Select, move, cut, copy, and paste objects; drag individual vertex handles
 - Right-click a vertex to delete it; right-click an edge to insert a new vertex
 - Shift-lock to cardinal directions while placing measurement points
@@ -18,6 +24,7 @@ labelled objects, and measure distances, angles, areas, and polyline lengths.
 - Python 3.13+
 - PySide6 >= 6.5
 - PyMuPDF >= 1.23
+- Shapely >= 2.0
 
 ## Installation
 
@@ -50,6 +57,9 @@ then set a scale before placing measurements.
 | `G`         | Add Angle (middle click = vertex)                |
 | `A`         | Add Area (double-click or right-click to close)  |
 | `N`         | Add Polyline (double-click or right-click to finish) |
+| `K`         | Add Polyline Contour (finish, then define levels) |
+| `P`         | Add Point Contour (click, then define levels)    |
+| `Ctrl+L`    | Toggle text labels                               |
 | `Escape`    | Cancel current operation                         |
 | `Ctrl+Z`    | Undo                                             |
 | `Ctrl+Y`    | Redo                                             |
@@ -87,7 +97,11 @@ Sessions are saved as JSON:
 }
 ```
 
-`kind` is one of `"point"`, `"distance"`, `"angle"`, `"area"`, or `"polyline"`.
+`kind` is one of `"point"`, `"distance"`, `"angle"`, `"area"`, `"polyline"`,
+`"polyline_contour"`, or `"point_contour"`. Objects may also carry a `"color"`
+(hex string) and, for contours, a `"levels"` list of
+`{ "reference": str, "distance": float, "color": "#rrggbb" }`. The session may
+include a `"legend_title"` string.
 
 ## Project structure
 
@@ -98,6 +112,7 @@ src/
     core/
       models.py            Data classes: Point, ScaleInfo, DiagramObject
       constants.py         Tool enum, labels, shortcuts, and help text
+      contours.py          Risk-contour geometry (shapely buffer + union)
     gui/
       dialogs.py           Scale input, point label, export, and edit dialogs
       viewer.py            ImageViewer widget (rendering, pan/zoom, measurement logic)
