@@ -11,8 +11,10 @@ class Tool(Enum):
     ADD_POINT            = "add_point"
     ADD_LINE             = "add_line"
     ADD_ANGLE            = "add_angle"
-    ADD_AREA             = "add_area"
+    ADD_POLYGON          = "add_polygon"
     ADD_POLYLINE         = "add_polyline"
+    ADD_ELLIPSE          = "add_ellipse"
+    ADD_TEXTBOX          = "add_textbox"
     ADD_POLYLINE_CONTOUR = "add_polyline_contour"
     ADD_POINT_CONTOUR    = "add_point_contour"
 
@@ -27,8 +29,10 @@ TOOL_LABELS = {
     Tool.ADD_POINT:          "Add Point",
     Tool.ADD_LINE:           "Add Line",
     Tool.ADD_ANGLE:          "Add Angle",
-    Tool.ADD_AREA:           "Add Area",
+    Tool.ADD_POLYGON:        "Add Polygon",
     Tool.ADD_POLYLINE:       "Add Polyline",
+    Tool.ADD_ELLIPSE:        "Add Ellipse",
+    Tool.ADD_TEXTBOX:        "Add Text Box",
     Tool.ADD_POLYLINE_CONTOUR: "Add Polyline Contour",
     Tool.ADD_POINT_CONTOUR:    "Add Point Contour",
 }
@@ -43,8 +47,10 @@ TOOL_SHORTCUTS = {
     Tool.ADD_POINT:          "T",
     Tool.ADD_LINE:           "L",
     Tool.ADD_ANGLE:          "G",
-    Tool.ADD_AREA:           "A",
+    Tool.ADD_POLYGON:        "A",
     Tool.ADD_POLYLINE:       "N",
+    Tool.ADD_ELLIPSE:        "E",
+    Tool.ADD_TEXTBOX:        "B",
     Tool.ADD_POLYLINE_CONTOUR: "K",
     Tool.ADD_POINT_CONTOUR:    "P",
 }
@@ -59,8 +65,10 @@ TOOL_HELP = {
     Tool.ADD_POINT:          "Add Point — click to add a labelled point",
     Tool.ADD_LINE:           "Add Line — click 2 points to measure a straight line",
     Tool.ADD_ANGLE:          "Add Angle — click 3 points (middle point is the vertex)",
-    Tool.ADD_AREA:           "Add Area — click vertices · double-click or right-click to close",
+    Tool.ADD_POLYGON:        "Add Polygon — click vertices · double-click or right-click to close",
     Tool.ADD_POLYLINE:       "Add Polyline — click vertices · double-click or right-click to finish",
+    Tool.ADD_ELLIPSE:        "Add Ellipse — click 2 corners of the bounding box · hold Shift for a circle",
+    Tool.ADD_TEXTBOX:        "Add Text Box — click 2 corners of the box · then enter text and style",
     Tool.ADD_POLYLINE_CONTOUR: "Add Polyline Contour — click vertices · double-click to finish · then define contour levels",
     Tool.ADD_POINT_CONTOUR:    "Add Point Contour — click a point · then define contour levels",
 }

@@ -12,14 +12,15 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QMenu, QMessageBox, QSizePolicy, QTabBar, QWidget,
+    QApplication, QDialog, QMenu, QMessageBox, QPlainTextEdit, QSizePolicy,
+    QTabBar, QWidget,
 )
 
 from ..core.constants import Tool
 from ..core import contours
 from .dialogs import (
     ContourLevelsDialog, EditObjectDialog, LegendTitleDialog, NameDialog,
-    ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog,
+    ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog, TextBoxDialog,
 )
 from ..core.models import DiagramObject, Point, ScaleInfo
 
@@ -30,8 +31,10 @@ _KIND_COLOR = {
     "point":    QColor("#4488ff"),
     "distance": QColor("#ffdd00"),
     "angle":    QColor("#ff8800"),
-    "area":     QColor("#ff6699"),
+    "polygon":  QColor("#ff6699"),
     "polyline": QColor("#44ddaa"),
+    "ellipse":  QColor("#22bbee"),
+    "textbox":  QColor("#dddddd"),
     "polyline_contour": QColor("#999999"),
     "point_contour":    QColor("#999999"),
 }
@@ -39,6 +42,25 @@ _SEL_COLOR   = QColor("#ff2222")
 _LABEL_COLOR = QColor("#dd0000")
 _PREVIEW_COLOR = QColor("#dd0000")
 _SKELETON_COLOR = QColor("#aaaaaa")   # thin dashed defining geometry of contours
+_BBOX_COLOR  = QColor("#aaaaaa")      # thin dashed bounding box (ellipse/textbox)
+
+_PEN_STYLES = {
+    "solid":   Qt.PenStyle.SolidLine,
+    "dashed":  Qt.PenStyle.DashLine,
+    "dotted":  Qt.PenStyle.DotLine,
+    "dashdot": Qt.PenStyle.DashDotLine,
+}
+
+_H_ALIGN = {
+    "left":   Qt.AlignmentFlag.AlignLeft,
+    "center": Qt.AlignmentFlag.AlignHCenter,
+    "right":  Qt.AlignmentFlag.AlignRight,
+}
+_V_ALIGN = {
+    "top":    Qt.AlignmentFlag.AlignTop,
+    "middle": Qt.AlignmentFlag.AlignVCenter,
+    "bottom": Qt.AlignmentFlag.AlignBottom,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +97,25 @@ def _snap_cardinal(base: QPointF, pos: QPointF) -> QPointF:
     return QPointF(base.x() + dist * math.cos(snapped), base.y() + dist * math.sin(snapped))
 
 
+def _square_box(base: QPointF, pos: QPointF) -> QPointF:
+    """Constrain the opposite corner so the box base→pos is square (for a 1:1
+    ellipse / circle while holding Shift)."""
+    dx = pos.x() - base.x()
+    dy = pos.y() - base.y()
+    m = max(abs(dx), abs(dy))
+    sx = -1.0 if dx < 0 else 1.0
+    sy = -1.0 if dy < 0 else 1.0
+    return QPointF(base.x() + sx * m, base.y() + sy * m)
+
+
+def _ellipse_circumference(a: float, b: float) -> float:
+    """Ramanujan's approximation of an ellipse circumference (semi-axes a, b)."""
+    if a <= 0 and b <= 0:
+        return 0.0
+    h = ((a - b) ** 2) / ((a + b) ** 2) if (a + b) else 0.0
+    return math.pi * (a + b) * (1 + (3 * h) / (10 + math.sqrt(4 - 3 * h)))
+
+
 def _seg_insert_point(screen_pos: QPointF, sa: QPointF, sb: QPointF) -> QPointF:
     """Project screen_pos onto segment sa→sb and return the closest screen point."""
     ax, ay = sa.x(), sa.y()
@@ -83,6 +124,41 @@ def _seg_insert_point(screen_pos: QPointF, sa: QPointF, sb: QPointF) -> QPointF:
     denom = dx * dx + dy * dy
     t = max(0.0, min(1.0, ((screen_pos.x() - ax) * dx + (screen_pos.y() - ay) * dy) / denom)) if denom else 0.0
     return QPointF(ax + t * dx, ay + t * dy)
+
+
+# ---------------------------------------------------------------------------
+# Inline text-box editor (overlay shown on double-click)
+# ---------------------------------------------------------------------------
+
+class _InlineTextEditor(QPlainTextEdit):
+    """A floating editor for changing a text box's content in place. Commits on
+    focus-out or Ctrl+Enter; cancels on Escape."""
+    committed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._done = False
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self._done = True
+            self.cancelled.emit()
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self._done = True
+            self.committed.emit(self.toPlainText())
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event):
+        if not self._done:
+            self._done = True
+            self.committed.emit(self.toPlainText())
+        super().focusOutEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +265,10 @@ class ImageViewer(QWidget):
         # View toggles
         self._show_objects = True
         self._show_labels = True
+
+        # Inline text-box editor (created on demand)
+        self._inline_editor: Optional[_InlineTextEditor] = None
+        self._inline_obj_idx = -1
 
         # Contour render cache (rebuilt only when the signature changes)
         self._contour_cache: list = []
@@ -479,6 +559,7 @@ class ImageViewer(QWidget):
         return label
 
     def _cancel_transient_interactions(self):
+        self._finish_inline_edit()
         self._panning = False
         self._pan_moved = False
         self._vtx_drag_active = False
@@ -538,6 +619,7 @@ class ImageViewer(QWidget):
             self._tab_bar.hide()
 
     def resizeEvent(self, event):
+        self._finish_inline_edit()
         self._update_geometry()
         super().resizeEvent(event)
 
@@ -833,35 +915,42 @@ class ImageViewer(QWidget):
         painter.drawLine(x - 12, y, x + 12, y)
         painter.drawLine(x, y - 12, x, y + 12)
 
+    def _obj_pen(self, obj: DiagramObject, selected: bool) -> QPen:
+        """Stroke pen for a line-based object, honoring its color, line width,
+        and line style (selection overrides the color)."""
+        color = _SEL_COLOR if selected else (
+            QColor(obj.color) if obj.color else _KIND_COLOR.get(obj.kind, QColor("white"))
+        )
+        width = obj.line_width if obj.line_width and obj.line_width > 0 else 2.0
+        pen = QPen(color, width)
+        pen.setStyle(_PEN_STYLES.get(obj.line_style, Qt.PenStyle.SolidLine))
+        return pen
+
     def _paint_objects(self, painter: QPainter):
         for i, obj in enumerate(self.objects):
             selected = i in self._selection
-            color    = QColor(obj.color) if obj.color else _KIND_COLOR.get(obj.kind, QColor("white"))
 
             if obj.kind == "point":
                 self._paint_point(painter, obj, i, selected)
             elif obj.kind == "distance":
-                self._paint_distance(painter, obj, color, selected)
-                if selected:
-                    self._paint_vertex_handles(painter, obj.points)
+                self._paint_distance(painter, obj, selected)
             elif obj.kind == "angle":
-                self._paint_angle(painter, obj, color, selected)
-                if selected:
-                    self._paint_vertex_handles(painter, obj.points)
-            elif obj.kind == "area":
-                self._paint_area(painter, obj, color, selected)
-                if selected:
-                    self._paint_vertex_handles(painter, obj.points)
+                self._paint_angle(painter, obj, selected)
+            elif obj.kind == "polygon":
+                self._paint_polygon(painter, obj, selected)
             elif obj.kind == "polyline":
-                self._paint_polyline(painter, obj, color, selected)
-                if selected:
-                    self._paint_vertex_handles(painter, obj.points)
+                self._paint_polyline(painter, obj, selected)
+            elif obj.kind == "ellipse":
+                self._paint_ellipse(painter, obj, selected)
+            elif obj.kind == "textbox":
+                self._paint_textbox(painter, obj, selected)
             elif obj.kind == "polyline_contour":
                 self._paint_contour_skeleton(painter, obj, selected, closed=False)
-                if selected:
-                    self._paint_vertex_handles(painter, obj.points)
             elif obj.kind == "point_contour":
                 self._paint_contour_skeleton(painter, obj, selected, closed=False)
+
+            if selected and obj.kind not in ("point", "point_contour"):
+                self._paint_vertex_handles(painter, obj.points)
 
     def _paint_point(self, painter, obj, idx, selected):
         if not obj.points:
@@ -882,68 +971,124 @@ class ImageViewer(QWidget):
         painter.setPen(_LABEL_COLOR)
         painter.drawText(QPointF(sp.x() + 9, sp.y() + 6), f"({wx:.2f}, {wy:.2f})")
 
-    def _paint_distance(self, painter, obj, color, selected):
+    def _paint_obj_label(self, painter, anchor: QPointF, obj, fallback: str):
+        """Draw an object's name + all its measurements near `anchor` (baseline
+        of the first line). A single measurement reads 'Name: value'; multiple
+        measurements are listed one per line under the name."""
+        if not self._show_labels:
+            return
+        name = obj.name or fallback
+        ms = obj.measurements()
+        painter.setPen(_LABEL_COLOR)
+        if len(ms) <= 1:
+            text = f"{name}: {ms[0][1]}" if ms else name
+            painter.drawText(anchor, text)
+            return
+        line_h = painter.fontMetrics().height()
+        painter.drawText(anchor, name)
+        for i, (lbl, val) in enumerate(ms, start=1):
+            painter.drawText(QPointF(anchor.x(), anchor.y() + i * line_h),
+                             f"{lbl}: {val}")
+
+    def _paint_distance(self, painter, obj, selected):
         if len(obj.points) < 2:
             return
-        draw_color = _SEL_COLOR if selected else color
         sp0 = self._img_to_screen(QPointF(*obj.points[0]))
         sp1 = self._img_to_screen(QPointF(*obj.points[1]))
-        painter.setPen(QPen(draw_color, 2))
+        painter.setPen(self._obj_pen(obj, selected))
         painter.drawLine(sp0, sp1)
-        if not self._show_labels:
-            return
         mid = QPointF((sp0.x() + sp1.x()) / 2, (sp0.y() + sp1.y()) / 2)
-        painter.setPen(_LABEL_COLOR)
-        label = obj.name or "Line"
-        painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), f"{label}: {obj.display_short()}")
+        self._paint_obj_label(painter, QPointF(mid.x() + 5, mid.y() - 5), obj, "Line")
 
-    def _paint_angle(self, painter, obj, color, selected):
+    def _paint_angle(self, painter, obj, selected):
         if len(obj.points) < 3:
             return
-        draw_color = _SEL_COLOR if selected else color
         sp = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-        painter.setPen(QPen(draw_color, 2))
+        painter.setPen(self._obj_pen(obj, selected))
         painter.drawLine(sp[0], sp[1])
         painter.drawLine(sp[2], sp[1])
-        if not self._show_labels:
-            return
-        painter.setPen(_LABEL_COLOR)
-        label = obj.name or "Angle"
-        painter.drawText(QPointF(sp[1].x() + 5, sp[1].y() - 5), f"{label}: {obj.display_short()}")
+        self._paint_obj_label(painter, QPointF(sp[1].x() + 5, sp[1].y() - 5), obj, "Angle")
 
-    def _paint_area(self, painter, obj, color, selected):
+    def _paint_polygon(self, painter, obj, selected):
         if len(obj.points) < 3:
             return
-        draw_color = _SEL_COLOR if selected else color
+        pen = self._obj_pen(obj, selected)
         sps = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-        fill = QColor(draw_color)
+        fill = QColor(pen.color())
         fill.setAlpha(40)
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(draw_color, 2))
+        painter.setPen(pen)
         painter.drawPolygon(QPolygonF(sps))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        if not self._show_labels:
-            return
         cx = sum(s.x() for s in sps) / len(sps)
         cy = sum(s.y() for s in sps) / len(sps)
-        painter.setPen(_LABEL_COLOR)
-        label = obj.name or "Area"
-        painter.drawText(QPointF(cx + 5, cy), f"{label}: {obj.display_short()}")
+        self._paint_obj_label(painter, QPointF(cx + 5, cy), obj, "Polygon")
 
-    def _paint_polyline(self, painter, obj, color, selected):
+    def _paint_polyline(self, painter, obj, selected):
         if len(obj.points) < 2:
             return
-        draw_color = _SEL_COLOR if selected else color
         sps = [self._img_to_screen(QPointF(*p)) for p in obj.points]
-        painter.setPen(QPen(draw_color, 2))
+        painter.setPen(self._obj_pen(obj, selected))
         for i in range(len(sps) - 1):
             painter.drawLine(sps[i], sps[i + 1])
-        if not self._show_labels:
-            return
         mid = sps[len(sps) // 2]
-        painter.setPen(_LABEL_COLOR)
-        label = obj.name or "Polyline"
-        painter.drawText(QPointF(mid.x() + 5, mid.y() - 5), f"{label}: {obj.display_short()}")
+        self._paint_obj_label(painter, QPointF(mid.x() + 5, mid.y() - 5), obj, "Polyline")
+
+    def _paint_ellipse(self, painter, obj, selected):
+        if len(obj.points) < 2:
+            return
+        sp0 = self._img_to_screen(QPointF(*obj.points[0]))
+        sp1 = self._img_to_screen(QPointF(*obj.points[1]))
+        rect = QRectF(sp0, sp1).normalized()
+        # thin dashed bounding box
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(_SEL_COLOR if selected else _BBOX_COLOR, 1, Qt.PenStyle.DashLine))
+        painter.drawRect(rect)
+        # the ellipse itself
+        painter.setPen(self._obj_pen(obj, selected))
+        painter.drawEllipse(rect)
+        self._paint_obj_label(painter, QPointF(rect.center().x() + 5, rect.top() - 5),
+                              obj, "Ellipse")
+
+    def _paint_textbox(self, painter, obj, selected):
+        if len(obj.points) < 2:
+            return
+        sp0 = self._img_to_screen(QPointF(*obj.points[0]))
+        sp1 = self._img_to_screen(QPointF(*obj.points[1]))
+        rect = QRectF(sp0, sp1).normalized()
+
+        # fill (optional)
+        if obj.fill_color:
+            painter.setBrush(QBrush(QColor(obj.fill_color)))
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._obj_pen(obj, selected))
+        painter.drawRect(rect)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # text (hidden while this box is being edited in place)
+        editing = (
+            self._inline_editor is not None
+            and 0 <= self._inline_obj_idx < len(self.objects)
+            and self.objects[self._inline_obj_idx] is obj
+        )
+        if obj.text and not editing:
+            font = QFont(painter.font())
+            if obj.font_family:
+                font.setFamily(obj.font_family)
+            size = obj.font_size if obj.font_size and obj.font_size > 0 else 12
+            # scale font with zoom so text tracks the box
+            font.setPointSizeF(max(1.0, size * self._zoom))
+            font.setBold(obj.bold)
+            font.setItalic(obj.italic)
+            font.setUnderline(obj.underline)
+            painter.setFont(font)
+            painter.setPen(QColor(obj.font_color) if obj.font_color else QColor("#ffffff"))
+            align = (_H_ALIGN.get(obj.h_align, Qt.AlignmentFlag.AlignLeft)
+                     | _V_ALIGN.get(obj.v_align, Qt.AlignmentFlag.AlignTop))
+            painter.drawText(rect.adjusted(4, 2, -4, -2),
+                             int(align | Qt.TextFlag.TextWordWrap),
+                             obj.text)
 
     def _paint_contour_skeleton(self, painter, obj, selected, closed=False):
         """Thin dashed defining geometry (polyline or single point) of a contour
@@ -1009,7 +1154,7 @@ class ImageViewer(QWidget):
                 painter.setPen(QPen(QColor("#cc66ff"), 1, Qt.PenStyle.DashLine))
                 painter.drawLine(pts_screen[0], preview)
 
-        elif tool == Tool.ADD_AREA:
+        elif tool == Tool.ADD_POLYGON:
             all_pts = pts_screen + ([preview] if preview else [])
             painter.setPen(QPen(QColor("#ff6699"), 2))
             fill = QColor("#ff6699")
@@ -1032,6 +1177,16 @@ class ImageViewer(QWidget):
             painter.setPen(QColor("white"))
             for i, sp in enumerate(pts_screen):
                 painter.drawText(QPointF(sp.x() + 7, sp.y() - 4), str(i + 1))
+
+        elif tool in (Tool.ADD_ELLIPSE, Tool.ADD_TEXTBOX):
+            if len(pts_screen) == 1 and preview:
+                rect = QRectF(pts_screen[0], preview).normalized()
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(_BBOX_COLOR, 1, Qt.PenStyle.DashLine))
+                painter.drawRect(rect)
+                if tool == Tool.ADD_ELLIPSE:
+                    painter.setPen(QPen(_KIND_COLOR["ellipse"], 2))
+                    painter.drawEllipse(rect)
 
     def _paint_zoom_rect(self, painter: QPainter):
         if self.current_tool != Tool.ZOOM_RECT or self._zoom_rect_start is None:
@@ -1177,7 +1332,10 @@ class ImageViewer(QWidget):
 
     def _apply_snap(self, img_pos: QPointF) -> QPointF:
         if self._shift_pressed() and self._temp:
-            return _snap_cardinal(QPointF(self._temp[-1].x, self._temp[-1].y), img_pos)
+            base = QPointF(self._temp[-1].x, self._temp[-1].y)
+            if self.current_tool == Tool.ADD_ELLIPSE:
+                return _square_box(base, img_pos)
+            return _snap_cardinal(base, img_pos)
         return img_pos
 
     # ------------------------------------------------------------------
@@ -1185,6 +1343,7 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
 
     def set_tool(self, tool: Tool):
+        self._finish_inline_edit()
         self._vtx_drag_active = False
         self._vtx_drag_obj    = -1
         self._vtx_drag_vtx    = -1
@@ -1205,6 +1364,7 @@ class ImageViewer(QWidget):
     def mousePressEvent(self, event):
         if self._active is None:
             return
+        self._finish_inline_edit()
         self._nudge_burst_active = False
         pos = QPointF(event.position())
         btn = event.button()
@@ -1271,7 +1431,14 @@ class ImageViewer(QWidget):
             dy = img_pos.y() - self._vtx_drag_start_img.y()
             obj = self.objects[self._vtx_drag_obj]
             ox, oy = self._vtx_drag_start_pts[self._vtx_drag_vtx]
-            obj.points[self._vtx_drag_vtx] = [ox + dx, oy + dy]
+            new_pt = QPointF(ox + dx, oy + dy)
+            # Shift while resizing an ellipse keeps it a circle: constrain the
+            # dragged corner square relative to the (fixed) opposite corner.
+            if (obj.kind == "ellipse" and self._shift_pressed()
+                    and len(self._vtx_drag_start_pts) == 2):
+                fx, fy = self._vtx_drag_start_pts[1 - self._vtx_drag_vtx]
+                new_pt = _square_box(QPointF(fx, fy), new_pt)
+            obj.points[self._vtx_drag_vtx] = [new_pt.x(), new_pt.y()]
             self._recalculate_object(obj)
             self.update()
             return
@@ -1365,16 +1532,21 @@ class ImageViewer(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         tool = self.current_tool
-        # Double-click the on-canvas legend (in PAN/SELECT) to edit its title.
-        if tool in (Tool.PAN, Tool.SELECT) and self._show_objects \
-                and self._legend_rect is not None \
-                and self._legend_rect.contains(QPointF(event.position())):
-            self.edit_legend_title()
-            return
+        if tool in (Tool.PAN, Tool.SELECT) and self._show_objects:
+            pos = QPointF(event.position())
+            # Double-click the on-canvas legend to edit its title.
+            if self._legend_rect is not None and self._legend_rect.contains(pos):
+                self.edit_legend_title()
+                return
+            # Double-click a text box to edit its text in place.
+            hit = self._hit_object(pos)
+            if hit >= 0 and self.objects[hit].kind == "textbox":
+                self._begin_inline_text_edit(hit)
+                return
         # The first click of the double-click already added a point via mousePressEvent.
         # Finish with that point included.
-        if tool == Tool.ADD_AREA and len(self._temp) >= 3:
-            self._finish_area()
+        if tool == Tool.ADD_POLYGON and len(self._temp) >= 3:
+            self._finish_polygon()
         elif tool == Tool.ADD_POLYLINE and len(self._temp) >= 2:
             self._finish_polyline()
         elif tool == Tool.ADD_POLYLINE_CONTOUR and len(self._temp) >= 2:
@@ -1383,6 +1555,7 @@ class ImageViewer(QWidget):
     def wheelEvent(self, event):
         if self._active is None:
             return
+        self._finish_inline_edit()
         pos = QPointF(event.position())
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
         mouse_img = self._screen_to_img(pos)
@@ -1651,8 +1824,8 @@ class ImageViewer(QWidget):
         tool    = self.current_tool
 
         snapping_tools = {
-            Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE,
-            Tool.ADD_POLYLINE_CONTOUR,
+            Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_POLYGON, Tool.ADD_POLYLINE,
+            Tool.ADD_POLYLINE_CONTOUR, Tool.ADD_ELLIPSE,
             Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
         }
         if self._shift_pressed() and self._temp and tool in snapping_tools:
@@ -1680,7 +1853,7 @@ class ImageViewer(QWidget):
             result = self._ask_name_and_color("point")
             if result is None:
                 return
-            name, color = result
+            name, color, _lw, _ls = result
             self._push_undo()
             obj = DiagramObject(
                 kind="point", name=name, color=color,
@@ -1705,7 +1878,19 @@ class ImageViewer(QWidget):
                 self._finish_angle()
             self.update()
 
-        elif tool in (Tool.ADD_AREA, Tool.ADD_POLYLINE, Tool.ADD_POLYLINE_CONTOUR):
+        elif tool == Tool.ADD_ELLIPSE:
+            self._temp.append(img_pt)
+            if len(self._temp) == 2:
+                self._finish_ellipse()
+            self.update()
+
+        elif tool == Tool.ADD_TEXTBOX:
+            self._temp.append(img_pt)
+            if len(self._temp) == 2:
+                self._finish_textbox()
+            self.update()
+
+        elif tool in (Tool.ADD_POLYGON, Tool.ADD_POLYLINE, Tool.ADD_POLYLINE_CONTOUR):
             self._temp.append(img_pt)
             self.update()
 
@@ -1716,9 +1901,9 @@ class ImageViewer(QWidget):
             self._show_pan_context_menu(screen_pos)
             return
 
-        # Close area / finish polyline, or pop last temp point
-        if tool == Tool.ADD_AREA and len(self._temp) >= 3:
-            self._finish_area()
+        # Close polygon / finish polyline, or pop last temp point
+        if tool == Tool.ADD_POLYGON and len(self._temp) >= 3:
+            self._finish_polygon()
             return
         if tool == Tool.ADD_POLYLINE and len(self._temp) >= 2:
             self._finish_polyline()
@@ -1820,7 +2005,7 @@ class ImageViewer(QWidget):
         vtx_obj, vtx_idx = self._hit_selected_vertex(screen_pos)
         if vtx_obj >= 0:
             obj = self.objects[vtx_obj]
-            min_verts = 3 if obj.kind == "area" else 2
+            min_verts = 3 if obj.kind == "polygon" else 2
             if len(obj.points) > min_verts:
                 menu = QMenu(self)
                 menu.addAction("Delete Vertex", lambda: self._delete_vertex(vtx_obj, vtx_idx))
@@ -1888,7 +2073,7 @@ class ImageViewer(QWidget):
 
     def _delete_vertex(self, obj_idx: int, vtx_idx: int):
         obj = self.objects[obj_idx]
-        min_verts = 3 if obj.kind == "area" else 2
+        min_verts = 3 if obj.kind == "polygon" else 2
         if len(obj.points) <= min_verts:
             return
         self._push_undo()
@@ -1911,15 +2096,19 @@ class ImageViewer(QWidget):
 
     def _open_edit_dialog(self, idx: int):
         obj = self.objects[idx]
+        if obj.kind == "textbox":
+            self._edit_textbox(idx)
+            return
         world_pts = [self.img_to_world(QPointF(*p)) for p in obj.points]
         dlg = EditObjectDialog(
             obj.kind, obj.name, world_pts,
             color=obj.color, levels=obj.levels, unit=self.scale_info.unit,
+            line_width=obj.line_width, line_style=obj.line_style,
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_name, new_world_pts, new_color, new_levels = dlg.values()
+        new_name, new_world_pts, new_color, new_levels, new_lw, new_ls = dlg.values()
         self._push_undo()
         obj.name   = new_name
         obj.points = [[*(self._world_to_img(wx, wy).toTuple())] for wx, wy in new_world_pts]
@@ -1927,13 +2116,127 @@ class ImageViewer(QWidget):
             obj.levels = new_levels
         else:
             obj.color = new_color
+            obj.line_width = new_lw
+            obj.line_style = new_ls
             if obj.kind != "point":
                 self._recalculate_object(obj)
         self.objects_changed.emit()
         self.update()
 
+    def _edit_textbox(self, idx: int):
+        obj = self.objects[idx]
+        dlg = TextBoxDialog(
+            name=obj.name, text=obj.text, font_family=obj.font_family,
+            font_size=obj.font_size, font_color=obj.font_color,
+            line_color=obj.color, fill_color=obj.fill_color,
+            line_width=obj.line_width, line_style=obj.line_style,
+            bold=obj.bold, italic=obj.italic, underline=obj.underline,
+            h_align=obj.h_align, v_align=obj.v_align, parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        self._push_undo()
+        obj.name = v["name"]
+        obj.text = v["text"]
+        obj.font_family = v["font_family"]
+        obj.font_size = v["font_size"]
+        obj.font_color = v["font_color"]
+        obj.color = v["line_color"]
+        obj.fill_color = v["fill_color"]
+        obj.line_width = v["line_width"]
+        obj.line_style = v["line_style"]
+        obj.bold = v["bold"]
+        obj.italic = v["italic"]
+        obj.underline = v["underline"]
+        obj.h_align = v["h_align"]
+        obj.v_align = v["v_align"]
+        self.objects_changed.emit()
+        self.update()
+
     def open_edit_dialog_for(self, idx: int):
         self._open_edit_dialog(idx)
+
+    # ------------------------------------------------------------------
+    # Inline text-box editing (double-click)
+    # ------------------------------------------------------------------
+
+    def _begin_inline_text_edit(self, idx: int):
+        obj = self.objects[idx]
+        if obj.kind != "textbox" or len(obj.points) < 2:
+            return
+        self._finish_inline_edit()   # close any prior editor first
+
+        sp0 = self._img_to_screen(QPointF(*obj.points[0]))
+        sp1 = self._img_to_screen(QPointF(*obj.points[1]))
+        rect = QRectF(sp0, sp1).normalized().toRect()
+        canvas = QRect(0, self._canvas_top(), self.width(), self._canvas_height())
+        rect = rect.intersected(canvas)
+        if rect.width() < 60:
+            rect.setWidth(60)
+        if rect.height() < 28:
+            rect.setHeight(28)
+
+        ed = _InlineTextEditor(self)
+        ed.setPlainText(obj.text)
+        font = QFont(ed.font())
+        if obj.font_family:
+            font.setFamily(obj.font_family)
+        size = obj.font_size if obj.font_size and obj.font_size > 0 else 12
+        font.setPointSizeF(max(1.0, size * self._zoom))
+        font.setBold(obj.bold)
+        font.setItalic(obj.italic)
+        font.setUnderline(obj.underline)
+        ed.setFont(font)
+        fg = obj.font_color or "#ffffff"
+        bg = obj.fill_color or "#3a3a3a"
+        ed.setStyleSheet(
+            f"QPlainTextEdit {{ color: {fg}; background-color: {bg}; "
+            "border: 1px solid #ff2222; }"
+        )
+        ed.setGeometry(rect)
+        ed.committed.connect(self._apply_inline_text)
+        ed.cancelled.connect(self._close_inline_editor)
+
+        self._inline_editor = ed
+        self._inline_obj_idx = idx
+        ed.show()
+        ed.setFocus(Qt.FocusReason.MouseFocusReason)
+        ed.selectAll()
+        self.update()
+
+    def _apply_inline_text(self, text: str):
+        idx = self._inline_obj_idx
+        if 0 <= idx < len(self.objects) and self.objects[idx].kind == "textbox":
+            obj = self.objects[idx]
+            if text != obj.text:
+                self._push_undo()
+                obj.text = text
+                self.objects_changed.emit()
+        self._close_inline_editor()
+
+    def _close_inline_editor(self):
+        ed = self._inline_editor
+        self._inline_editor = None
+        self._inline_obj_idx = -1
+        if ed is not None:
+            try:
+                ed.blockSignals(True)
+            except RuntimeError:
+                pass
+            ed.deleteLater()
+        self.update()
+
+    def _finish_inline_edit(self):
+        """Force-commit any active inline editor (before pan/zoom/tab switch)."""
+        ed = self._inline_editor
+        if ed is None:
+            return
+        if not ed._done:
+            ed._done = True
+            self._apply_inline_text(ed.toPlainText())
+        else:
+            self._close_inline_editor()
 
     # ------------------------------------------------------------------
     # Hit testing
@@ -1968,7 +2271,7 @@ class ImageViewer(QWidget):
             d2 = _dist_pt_to_seg(sp.x(), sp.y(), s[2].x(), s[2].y(), s[1].x(), s[1].y())
             return min(d1, d2) <= _HIT_R
 
-        if obj.kind == "area" and len(obj.points) >= 3:
+        if obj.kind == "polygon" and len(obj.points) >= 3:
             if _point_in_polygon(px, py, obj.points):
                 return True
             n = len(obj.points)
@@ -1985,6 +2288,23 @@ class ImageViewer(QWidget):
                 sb = self._img_to_screen(QPointF(*obj.points[j + 1]))
                 if _dist_pt_to_seg(sp.x(), sp.y(), sa.x(), sa.y(), sb.x(), sb.y()) <= _HIT_R:
                     return True
+
+        if obj.kind in ("ellipse", "textbox") and len(obj.points) >= 2:
+            s0 = self._img_to_screen(QPointF(*obj.points[0]))
+            s1 = self._img_to_screen(QPointF(*obj.points[1]))
+            rect = QRectF(s0, s1).normalized()
+            if obj.kind == "textbox":
+                return rect.adjusted(-_HIT_R, -_HIT_R, _HIT_R, _HIT_R).contains(sp)
+            # ellipse: inside the ellipse, or near its bounding-box outline
+            cx, cy = rect.center().x(), rect.center().y()
+            rx = max(rect.width() / 2.0, 1e-6)
+            ry = max(rect.height() / 2.0, 1e-6)
+            if ((sp.x() - cx) / rx) ** 2 + ((sp.y() - cy) / ry) ** 2 <= 1.0:
+                return True
+            margin = rect.adjusted(-_HIT_R, -_HIT_R, _HIT_R, _HIT_R)
+            inner = rect.adjusted(_HIT_R, _HIT_R, -_HIT_R, -_HIT_R)
+            if margin.contains(sp) and not inner.contains(sp):
+                return True
 
         return False
 
@@ -2003,13 +2323,13 @@ class ImageViewer(QWidget):
         return -1, -1
 
     def _hit_selected_edge(self, screen_pos: QPointF) -> Tuple[int, int, QPointF]:
-        """Return (obj_idx, edge_start_idx, img_insert_pt) for first edge hit among selected area/polyline objects."""
+        """Return (obj_idx, edge_start_idx, img_insert_pt) for first edge hit among selected polygon/polyline objects."""
         for i in self._selection:
             obj = self.objects[i]
-            if obj.kind not in ("area", "polyline", "polyline_contour"):
+            if obj.kind not in ("polygon", "polyline", "polyline_contour"):
                 continue
             n = len(obj.points)
-            segs = range(n) if obj.kind == "area" else range(n - 1)
+            segs = range(n) if obj.kind == "polygon" else range(n - 1)
             for j in segs:
                 sa = self._img_to_screen(QPointF(*obj.points[j]))
                 sb = self._img_to_screen(QPointF(*obj.points[(j + 1) % n]))
@@ -2055,24 +2375,46 @@ class ImageViewer(QWidget):
         sf  = self.scale_info.scale_factor
         unit = self.scale_info.unit
         if obj.kind == "distance" and len(pts) == 2:
-            obj.value = pts[0].distance_to(pts[1]) * sf
+            length = pts[0].distance_to(pts[1]) * sf
+            obj.value = length
             obj.unit = unit
+            obj.measures = {"length": length}
         elif obj.kind == "polyline" and len(pts) >= 2:
-            obj.value = sum(pts[i].distance_to(pts[i + 1]) for i in range(len(pts) - 1)) * sf
+            length = sum(pts[i].distance_to(pts[i + 1]) for i in range(len(pts) - 1)) * sf
+            obj.value = length
             obj.unit = unit
+            obj.measures = {"length": length}
         elif obj.kind == "angle" and len(pts) == 3:
             p1, v, p2 = pts
             v1x, v1y = p1.x - v.x, p1.y - v.y
             v2x, v2y = p2.x - v.x, p2.y - v.y
             dot = v1x * v2x + v1y * v2y
             mag = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
-            obj.value = math.degrees(math.acos(max(-1.0, min(1.0, dot / mag)))) if mag > 0 else 0.0
+            angle = math.degrees(math.acos(max(-1.0, min(1.0, dot / mag)))) if mag > 0 else 0.0
+            obj.value = angle
             obj.unit = "°"
-        elif obj.kind == "area" and len(pts) >= 3:
+            obj.measures = {"angle": angle}
+        elif obj.kind == "polygon" and len(pts) >= 3:
             n = len(pts)
-            area = sum(pts[i].x * pts[(i+1)%n].y - pts[(i+1)%n].x * pts[i].y for i in range(n))
-            obj.value = abs(area) / 2.0 * (sf ** 2)
+            shoelace = sum(pts[i].x * pts[(i+1)%n].y - pts[(i+1)%n].x * pts[i].y
+                           for i in range(n))
+            area = abs(shoelace) / 2.0 * (sf ** 2)
+            perimeter = sum(pts[i].distance_to(pts[(i+1)%n]) for i in range(n)) * sf
+            obj.value = area
             obj.unit = unit
+            obj.measures = {"area": area, "perimeter": perimeter}
+        elif obj.kind == "ellipse" and len(pts) == 2:
+            a = abs(pts[0].x - pts[1].x) / 2.0 * sf
+            b = abs(pts[0].y - pts[1].y) / 2.0 * sf
+            circ = _ellipse_circumference(a, b)
+            obj.value = circ
+            obj.unit = unit
+            obj.measures = {
+                "circumference": circ,
+                "diameter_major": 2.0 * max(a, b),
+                "diameter_minor": 2.0 * min(a, b),
+                "area": math.pi * a * b,
+            }
 
     def _recalculate_all(self):
         for obj in self.objects:
@@ -2085,8 +2427,8 @@ class ImageViewer(QWidget):
 
     def _emit_live_measure(self):
         measure_tools = {
-            Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE,
-            Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
+            Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_POLYGON, Tool.ADD_POLYLINE,
+            Tool.ADD_ELLIPSE, Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS,
         }
         if not self._temp or self.current_tool not in measure_tools or self._mouse_img is None:
             self.live_measure.emit("")
@@ -2119,13 +2461,18 @@ class ImageViewer(QWidget):
                 d_px = math.hypot(cur.x() - last.x, cur.y() - last.y)
                 self.live_measure.emit(f"Dist: {d_px * sf:.4g} {unit}")
 
-        elif tool == Tool.ADD_AREA:
+        elif tool == Tool.ADD_POLYGON:
             if len(self._temp) >= 2:
                 pts = [[p.x, p.y] for p in self._temp] + [[cur.x(), cur.y()]]
                 n = len(pts)
-                area = sum(pts[i][0] * pts[(i+1)%n][1] - pts[(i+1)%n][0] * pts[i][1]
-                           for i in range(n))
-                self.live_measure.emit(f"Area: {abs(area)/2.0 * (sf**2):.4g} {unit}²")
+                shoelace = sum(pts[i][0] * pts[(i+1)%n][1] - pts[(i+1)%n][0] * pts[i][1]
+                               for i in range(n))
+                perim = sum(math.hypot(pts[(i+1)%n][0] - pts[i][0],
+                                       pts[(i+1)%n][1] - pts[i][1]) for i in range(n)) * sf
+                self.live_measure.emit(
+                    f"Area: {abs(shoelace)/2.0 * (sf**2):.4g} {unit}²  ·  "
+                    f"Perimeter: {perim:.4g} {unit}"
+                )
             else:
                 d_px = math.hypot(cur.x() - last.x, cur.y() - last.y)
                 self.live_measure.emit(f"Dist: {d_px * sf:.4g} {unit}")
@@ -2137,6 +2484,14 @@ class ImageViewer(QWidget):
                 for i in range(len(all_pts) - 1)
             )
             self.live_measure.emit(f"Length: {total * sf:.4g} {unit}")
+
+        elif tool == Tool.ADD_ELLIPSE:
+            a = abs(cur.x() - last.x) / 2.0 * sf
+            b = abs(cur.y() - last.y) / 2.0 * sf
+            self.live_measure.emit(
+                f"Circumference: {_ellipse_circumference(a, b):.4g} {unit}  ·  "
+                f"Area: {math.pi * a * b:.4g} {unit}²"
+            )
 
     # ------------------------------------------------------------------
     # Finish helpers
@@ -2174,20 +2529,20 @@ class ImageViewer(QWidget):
     def _default_object_name(self, kind: str) -> str:
         prefix = {
             "point": "P", "distance": "L", "angle": "A",
-            "area": "Area", "polyline": "PL",
+            "polygon": "Poly", "polyline": "PL", "ellipse": "E", "textbox": "Text",
             "polyline_contour": "PLC", "point_contour": "PtC",
         }.get(kind, kind.capitalize())
         count = sum(1 for o in self.objects if o.kind == kind) + 1
         return f"{prefix}{count}"
 
-    def _ask_name_and_color(self, kind: str) -> Optional[Tuple[str, str]]:
+    def _ask_name_and_color(self, kind: str) -> Optional[Tuple[str, str, float, str]]:
         default_color = _KIND_COLOR.get(kind, QColor("#ffffff")).name()
         dlg = NameDialog(kind, self._default_object_name(kind), default_color, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self._temp.clear()
             self.update()
             return None
-        return dlg.label(), dlg.color()
+        return dlg.label(), dlg.color(), dlg.line_width(), dlg.line_style()
 
     def _ask_contour_levels(self, kind: str):
         """Open the levels dialog for a freshly-placed contour. Returns
@@ -2208,10 +2563,10 @@ class ImageViewer(QWidget):
         result = self._ask_name_and_color("distance")
         if result is None:
             return
-        name, color = result
+        name, color, lw, ls = result
         p0, p1 = self._temp[0], self._temp[1]
         obj = DiagramObject(
-            kind="distance", name=name, color=color,
+            kind="distance", name=name, color=color, line_width=lw, line_style=ls,
             points=[[p0.x, p0.y], [p1.x, p1.y]],
             unit=self.scale_info.unit,
         )
@@ -2226,9 +2581,9 @@ class ImageViewer(QWidget):
         result = self._ask_name_and_color("angle")
         if result is None:
             return
-        name, color = result
+        name, color, lw, ls = result
         obj = DiagramObject(
-            kind="angle", name=name, color=color,
+            kind="angle", name=name, color=color, line_width=lw, line_style=ls,
             points=[[p.x, p.y] for p in self._temp],
             unit="°",
         )
@@ -2239,13 +2594,13 @@ class ImageViewer(QWidget):
         self._temp.clear()
         self.update()
 
-    def _finish_area(self):
-        result = self._ask_name_and_color("area")
+    def _finish_polygon(self):
+        result = self._ask_name_and_color("polygon")
         if result is None:
             return
-        name, color = result
+        name, color, lw, ls = result
         obj = DiagramObject(
-            kind="area", name=name, color=color,
+            kind="polygon", name=name, color=color, line_width=lw, line_style=ls,
             points=[[p.x, p.y] for p in self._temp],
             unit=self.scale_info.unit,
         )
@@ -2260,13 +2615,54 @@ class ImageViewer(QWidget):
         result = self._ask_name_and_color("polyline")
         if result is None:
             return
-        name, color = result
+        name, color, lw, ls = result
         obj = DiagramObject(
-            kind="polyline", name=name, color=color,
+            kind="polyline", name=name, color=color, line_width=lw, line_style=ls,
             points=[[p.x, p.y] for p in self._temp],
             unit=self.scale_info.unit,
         )
         self._recalculate_object(obj)
+        self._push_undo()
+        self.objects.append(obj)
+        self.objects_changed.emit()
+        self._temp.clear()
+        self.update()
+
+    def _finish_ellipse(self):
+        result = self._ask_name_and_color("ellipse")
+        if result is None:
+            return
+        name, color, lw, ls = result
+        p0, p1 = self._temp[0], self._temp[1]
+        obj = DiagramObject(
+            kind="ellipse", name=name, color=color, line_width=lw, line_style=ls,
+            points=[[p0.x, p0.y], [p1.x, p1.y]],
+            unit=self.scale_info.unit,
+        )
+        self._recalculate_object(obj)
+        self._push_undo()
+        self.objects.append(obj)
+        self.objects_changed.emit()
+        self._temp.clear()
+        self.update()
+
+    def _finish_textbox(self):
+        p0, p1 = self._temp[0], self._temp[1]
+        dlg = TextBoxDialog(name=self._default_object_name("textbox"), parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._temp.clear()
+            self.update()
+            return
+        v = dlg.values()
+        obj = DiagramObject(
+            kind="textbox", name=v["name"],
+            points=[[p0.x, p0.y], [p1.x, p1.y]],
+            color=v["line_color"], line_width=v["line_width"], line_style=v["line_style"],
+            text=v["text"], font_family=v["font_family"], font_size=v["font_size"],
+            font_color=v["font_color"], fill_color=v["fill_color"],
+            bold=v["bold"], italic=v["italic"], underline=v["underline"],
+            h_align=v["h_align"], v_align=v["v_align"],
+        )
         self._push_undo()
         self.objects.append(obj)
         self.objects_changed.emit()
@@ -2404,6 +2800,15 @@ class ImageViewer(QWidget):
             "legend_title": self.legend_title,
         }
 
+    def _recompute_missing_measures(self):
+        """Backfill derived measurements for objects that lack them (e.g. loaded
+        from an older session that only stored a single `value`)."""
+        for obj in self.objects:
+            if obj.kind in ("point", "textbox") or obj.is_contour:
+                continue
+            if not obj.measures:
+                self._recalculate_object(obj)
+
     def load_session(self, data: dict, progress=None):
         """Load a session. Optional `progress(current, total)` callback."""
         self.scale_info    = ScaleInfo.from_dict(data["scale_info"])
@@ -2438,6 +2843,7 @@ class ImageViewer(QWidget):
                 if progress is not None and (idx % 25 == 0 or idx == total - 1):
                     progress(idx + 1, total)
 
+        self._recompute_missing_measures()
         self._temp.clear()
         self._selection.clear()
         self.update()

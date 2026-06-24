@@ -4,12 +4,12 @@ import json
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QColorDialog, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListWidget, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFontComboBox, QFormLayout, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QMessageBox, QPlainTextEdit,
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..core.models import DiagramObject, Point
@@ -60,6 +60,49 @@ class ColorButton(QPushButton):
     def set_color(self, color):
         self._color = QColor(color)
         self._refresh()
+
+
+# Display label -> stored value for the line-style dropdown.
+LINE_STYLES = [("Solid", "solid"), ("Dashed", "dashed"),
+               ("Dotted", "dotted"), ("Dash-Dot", "dashdot")]
+
+
+class LineStyleControls(QWidget):
+    """Compact width spin-box + line-style dropdown, shared by the object
+    dialogs so any line-based object can set its stroke."""
+
+    def __init__(self, width=0.0, style="solid", parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._width = QDoubleSpinBox()
+        self._width.setRange(0.5, 30.0)
+        self._width.setSingleStep(0.5)
+        self._width.setDecimals(1)
+        self._width.setValue(width if width and width > 0 else 2.0)
+
+        self._style = QComboBox()
+        for label, val in LINE_STYLES:
+            self._style.addItem(label, val)
+        self.set_style(style)
+
+        lay.addWidget(QLabel("Width:"))
+        lay.addWidget(self._width)
+        lay.addSpacing(8)
+        lay.addWidget(QLabel("Style:"))
+        lay.addWidget(self._style)
+        lay.addStretch()
+
+    def set_style(self, style: str):
+        idx = self._style.findData(style)
+        self._style.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def width(self) -> float:
+        return self._width.value()
+
+    def style(self) -> str:
+        return self._style.currentData()
 
 
 class ContourLevelsTable(QWidget):
@@ -287,7 +330,7 @@ _KIND_DISPLAY = {
     "point":    "Point",
     "distance": "Line",
     "angle":    "Angle",
-    "area":     "Area",
+    "polygon":  "Polygon",
     "polyline": "Polyline",
 }
 
@@ -306,6 +349,12 @@ class NameDialog(QDialog):
         self._color_btn = ColorButton(color or "#ffffff")
         form.addRow("Color:", self._color_btn)
 
+        # Line width/style for every line-based object (not plain points).
+        self._line = None
+        if kind != "point":
+            self._line = LineStyleControls()
+            form.addRow("Line:", self._line)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -321,6 +370,12 @@ class NameDialog(QDialog):
 
     def color(self) -> str:
         return self._color_btn.color_name()
+
+    def line_width(self) -> float:
+        return self._line.width() if self._line else 0.0
+
+    def line_style(self) -> str:
+        return self._line.style() if self._line else "solid"
 
 
 class SetOriginDialog(QDialog):
@@ -371,7 +426,8 @@ class EditObjectDialog(QDialog):
     }
 
     def __init__(self, kind: str, name: str, world_pts: list, color: str = "",
-                 levels: list = None, unit: str = "px", parent=None):
+                 levels: list = None, unit: str = "px",
+                 line_width: float = 0.0, line_style: str = "solid", parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Edit {kind.replace('_', ' ').title()}")
         self._kind = kind
@@ -383,9 +439,13 @@ class EditObjectDialog(QDialog):
         self.name_edit = QLineEdit(name)
         form.addRow("Name:", self.name_edit)
         self._color_btn = None
+        self._line = None
         if not self._is_contour:
             self._color_btn = ColorButton(color or "#ffffff")
             form.addRow("Color:", self._color_btn)
+            if kind != "point":
+                self._line = LineStyleControls(line_width, line_style)
+                form.addRow("Line:", self._line)
         layout.addLayout(form)
 
         self._levels = None
@@ -419,7 +479,7 @@ class EditObjectDialog(QDialog):
                 self._table.setItem(row, 1, QTableWidgetItem(f"{wy:.6f}"))
             layout.addWidget(QLabel("Vertices (world coordinates):"))
             layout.addWidget(self._table)
-            if kind in ("area", "polyline"):
+            if kind in ("polygon", "polyline"):
                 btn_row = QHBoxLayout()
                 add_btn = QPushButton("Add Vertex")
                 rem_btn = QPushButton("Remove Last")
@@ -456,15 +516,17 @@ class EditObjectDialog(QDialog):
         if self._table.rowCount() > minimum:
             self._table.setRowCount(self._table.rowCount() - 1)
 
-    def values(self) -> Tuple[str, list, str, list]:
-        """Return (name, world_pts, color, levels)."""
+    def values(self) -> Tuple[str, list, str, list, float, str]:
+        """Return (name, world_pts, color, levels, line_width, line_style)."""
         name = self.name_edit.text()
         color = self._color_btn.color_name() if self._color_btn else ""
+        lw = self._line.width() if self._line else 0.0
+        ls = self._line.style() if self._line else "solid"
 
         if self._is_contour:
-            return name, self._world_pts, color, self._levels.levels()
+            return name, self._world_pts, color, self._levels.levels(), lw, ls
         if self._kind == "point":
-            return name, [(self._wx.value(), self._wy.value())], color, []
+            return name, [(self._wx.value(), self._wy.value())], color, [], lw, ls
         pts = []
         for row in range(self._table.rowCount()):
             try:
@@ -473,11 +535,137 @@ class EditObjectDialog(QDialog):
             except (ValueError, AttributeError):
                 wx, wy = 0.0, 0.0
             pts.append((wx, wy))
-        return name, pts, color, []
+        return name, pts, color, [], lw, ls
+
+
+class TextBoxDialog(QDialog):
+    """Define a text box: content, font, colors, border line style, and fill."""
+
+    _H_ALIGNS = [("Left", "left"), ("Center", "center"), ("Right", "right")]
+    _V_ALIGNS = [("Top", "top"), ("Middle", "middle"), ("Bottom", "bottom")]
+
+    def __init__(self, name="", text="", font_family="", font_size=0,
+                 font_color="#ffffff", line_color="#ffffff", fill_color="",
+                 line_width=0.0, line_style="solid", bold=False, italic=False,
+                 underline=False, h_align="left", v_align="top", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Text Box")
+        layout = QVBoxLayout()
+
+        top = QFormLayout()
+        self.name_edit = QLineEdit(name)
+        top.addRow("Name:", self.name_edit)
+        layout.addLayout(top)
+
+        layout.addWidget(QLabel("Text:"))
+        self.text_edit = QPlainTextEdit(text)
+        self.text_edit.setMinimumHeight(80)
+        layout.addWidget(self.text_edit)
+
+        form = QFormLayout()
+        self.font_combo = QFontComboBox()
+        if font_family:
+            self.font_combo.setCurrentFont(QFont(font_family))
+        form.addRow("Font:", self.font_combo)
+
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(4, 200)
+        self.size_spin.setValue(font_size if font_size and font_size > 0 else 12)
+        form.addRow("Font size:", self.size_spin)
+
+        # Bold / Italic / Underline
+        style_row = QHBoxLayout()
+        self.bold_check = QCheckBox("Bold")
+        self.bold_check.setChecked(bool(bold))
+        self.italic_check = QCheckBox("Italic")
+        self.italic_check.setChecked(bool(italic))
+        self.underline_check = QCheckBox("Underline")
+        self.underline_check.setChecked(bool(underline))
+        style_row.addWidget(self.bold_check)
+        style_row.addWidget(self.italic_check)
+        style_row.addWidget(self.underline_check)
+        style_row.addStretch()
+        style_wrap = QWidget()
+        style_wrap.setLayout(style_row)
+        form.addRow("Style:", style_wrap)
+
+        # Horizontal / vertical alignment
+        align_row = QHBoxLayout()
+        self.halign_combo = QComboBox()
+        for lbl, val in self._H_ALIGNS:
+            self.halign_combo.addItem(lbl, val)
+        hi = self.halign_combo.findData(h_align)
+        self.halign_combo.setCurrentIndex(hi if hi >= 0 else 0)
+        self.valign_combo = QComboBox()
+        for lbl, val in self._V_ALIGNS:
+            self.valign_combo.addItem(lbl, val)
+        vi = self.valign_combo.findData(v_align)
+        self.valign_combo.setCurrentIndex(vi if vi >= 0 else 0)
+        align_row.addWidget(QLabel("Horizontal:"))
+        align_row.addWidget(self.halign_combo)
+        align_row.addSpacing(8)
+        align_row.addWidget(QLabel("Vertical:"))
+        align_row.addWidget(self.valign_combo)
+        align_row.addStretch()
+        align_wrap = QWidget()
+        align_wrap.setLayout(align_row)
+        form.addRow("Align:", align_wrap)
+
+        self.font_color_btn = ColorButton(font_color or "#ffffff")
+        form.addRow("Font color:", self.font_color_btn)
+
+        self.line_color_btn = ColorButton(line_color or "#ffffff")
+        form.addRow("Border color:", self.line_color_btn)
+
+        self._line = LineStyleControls(line_width, line_style)
+        form.addRow("Border line:", self._line)
+
+        fill_row = QHBoxLayout()
+        self.fill_check = QCheckBox("Fill")
+        self.fill_color_btn = ColorButton(fill_color or "#ffffcc")
+        has_fill = bool(fill_color)
+        self.fill_check.setChecked(has_fill)
+        self.fill_color_btn.setEnabled(has_fill)
+        self.fill_check.toggled.connect(self.fill_color_btn.setEnabled)
+        fill_row.addWidget(self.fill_check)
+        fill_row.addWidget(self.fill_color_btn)
+        fill_row.addStretch()
+        fill_wrap = QWidget()
+        fill_wrap.setLayout(fill_row)
+        form.addRow("Fill:", fill_wrap)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(440, 560)
+
+    def values(self) -> dict:
+        return {
+            "name": self.name_edit.text().strip(),
+            "text": self.text_edit.toPlainText(),
+            "font_family": self.font_combo.currentFont().family(),
+            "font_size": self.size_spin.value(),
+            "font_color": self.font_color_btn.color_name(),
+            "line_color": self.line_color_btn.color_name(),
+            "fill_color": (self.fill_color_btn.color_name()
+                           if self.fill_check.isChecked() else ""),
+            "line_width": self._line.width(),
+            "line_style": self._line.style(),
+            "bold": self.bold_check.isChecked(),
+            "italic": self.italic_check.isChecked(),
+            "underline": self.underline_check.isChecked(),
+            "h_align": self.halign_combo.currentData(),
+            "v_align": self.valign_combo.currentData(),
+        }
 
 
 class ExportDialog(QDialog):
-    _FIELDNAMES = ["type", "name", "value", "unit", "timestamp",
+    _FIELDNAMES = ["type", "name", "value", "unit", "measurements", "timestamp",
                    "levels", "world_points", "image_points"]
 
     def __init__(self, objects: List[DiagramObject], to_world=None, parent=None):
@@ -526,6 +714,7 @@ class ExportDialog(QDialog):
             "name":         obj.name,
             "value":        obj.value if has_value else "",
             "unit":         obj.unit  if has_value else "",
+            "measurements": obj._measure_inline() if has_value else "",
             "timestamp":    obj.timestamp,
             "levels":       levels_str,
             "world_points": world_str,

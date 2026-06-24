@@ -30,6 +30,8 @@ _C_LINE = QColor("#ffdd00")
 _C_ANGLE = QColor("#ff8800")
 _C_AREA = QColor("#ff6699")
 _C_POLY = QColor("#44ddaa")
+_C_ELLIPSE = QColor("#22bbee")
+_C_TEXT = QColor("#ffffff")
 _C_CONTOUR = QColor("#bbbbbb")
 
 
@@ -142,7 +144,7 @@ def _draw_angle(p):
     p.drawArc(QRectF(8 - 9, 24 - 9, 18, 18), 0, 42 * 16)
 
 
-def _draw_area(p):
+def _draw_polygon(p):
     fill = QColor(_C_AREA)
     fill.setAlpha(70)
     p.setPen(QPen(_C_AREA, 2.2))
@@ -155,6 +157,25 @@ def _draw_polyline(p):
     pts = [(6, 22), (13, 10), (19, 21), (26, 8)]
     for i in range(len(pts) - 1):
         _line(p, *pts[i], *pts[i + 1])
+
+
+def _draw_ellipse(p):
+    # dashed bounding box + solid ellipse, echoing the on-canvas representation
+    _pen(p, _fg(), 1.0, Qt.PenStyle.DashLine)
+    p.drawRect(QRectF(5, 9, 22, 14))
+    _pen(p, _C_ELLIPSE, 2.2)
+    p.drawEllipse(QRectF(5, 9, 22, 14))
+
+
+def _draw_textbox(p):
+    _pen(p, _fg(), 2.0)
+    p.drawRect(QRectF(4, 7, 24, 18))
+    f = p.font()
+    f.setPixelSize(13)
+    f.setBold(True)
+    p.setFont(f)
+    p.setPen(QPen(_C_TEXT, 1))
+    p.drawText(QRectF(4, 7, 24, 18), Qt.AlignmentFlag.AlignCenter, "A")
 
 
 def _draw_polyline_contour(p):
@@ -177,6 +198,16 @@ def _draw_point_contour(p):
 
 
 # --- File / document actions ----------------------------------------------
+
+def _draw_new(p):
+    # sheet of paper with a folded top-right corner
+    _pen(p, _fg(), 2.0)
+    fold = 7
+    p.drawPolygon(_poly([
+        (8, 4), (22 - fold, 4), (22, 4 + fold), (22, 28), (8, 28),
+    ]))
+    p.drawPolyline(_poly([(22 - fold, 4), (22 - fold, 4 + fold), (22, 4 + fold)]))
+
 
 def _draw_open(p):
     _pen(p, _fg(), 2.0)
@@ -221,13 +252,16 @@ _TOOL_DRAW = {
     Tool.ADD_POINT: _draw_point,
     Tool.ADD_LINE: _draw_line,
     Tool.ADD_ANGLE: _draw_angle,
-    Tool.ADD_AREA: _draw_area,
+    Tool.ADD_POLYGON: _draw_polygon,
     Tool.ADD_POLYLINE: _draw_polyline,
+    Tool.ADD_ELLIPSE: _draw_ellipse,
+    Tool.ADD_TEXTBOX: _draw_textbox,
     Tool.ADD_POLYLINE_CONTOUR: _draw_polyline_contour,
     Tool.ADD_POINT_CONTOUR: _draw_point_contour,
 }
 
 _ACTION_DRAW = {
+    "new": _draw_new,
     "open": _draw_open,
     "save": _draw_save,
     "export": _draw_export,

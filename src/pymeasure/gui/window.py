@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
 
         # File
         file_menu = mb.addMenu("&File")
+        self._add_action(file_menu, "&New",            "Ctrl+N",        self.new_document)
         self._add_action(file_menu, "&Open…",         "Ctrl+O",        self.open_file)
         self._recent_menu = file_menu.addMenu("Open &Recent")
         file_menu.addSeparator()
@@ -177,6 +178,9 @@ class MainWindow(QMainWindow):
         self._toolbar = tb
 
         # File / document actions
+        new_act = tb.addAction(icons.action_icon("new"), "New")
+        new_act.setToolTip("New — unload the current drawing  (Ctrl+N)")
+        new_act.triggered.connect(self.new_document)
         open_act = tb.addAction(icons.action_icon("open"), "Open")
         open_act.setToolTip("Open image or PDF  (Ctrl+O)")
         open_act.triggered.connect(self.open_file)
@@ -196,7 +200,8 @@ class MainWindow(QMainWindow):
         groups = [
             [Tool.PAN, Tool.SELECT, Tool.ZOOM_RECT],
             [Tool.SET_ORIGIN, Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS],
-            [Tool.ADD_POINT, Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_AREA, Tool.ADD_POLYLINE],
+            [Tool.ADD_POINT, Tool.ADD_LINE, Tool.ADD_ANGLE, Tool.ADD_POLYGON,
+             Tool.ADD_POLYLINE, Tool.ADD_ELLIPSE, Tool.ADD_TEXTBOX],
             [Tool.ADD_POINT_CONTOUR, Tool.ADD_POLYLINE_CONTOUR],
         ]
         for gi, group in enumerate(groups):
@@ -529,25 +534,14 @@ class MainWindow(QMainWindow):
         self._syncing_selection = False
 
     def _object_list_label(self, obj: DiagramObject) -> str:
-        icons = {
-            "point": "●", "distance": "─ ", "angle": "∠ ", "area": "▣ ",
-            "polyline": "〜 ", "polyline_contour": "◠ ", "point_contour": "◎ ",
-        }
-        icon = icons.get(obj.kind, "? ")
-        name = obj.name if obj.name else obj.kind.capitalize()
-        if obj.is_contour:
-            n = len(obj.levels)
-            return f"{icon}{name}: {n} level{'s' if n != 1 else ''}"
+        # Points show their world coordinates; everything else uses the model's
+        # own label (which already lists all of an object's measurements).
         if obj.kind == "point" and obj.points:
+            icon = obj._ICONS.get("point", "● ")
+            name = obj.name if obj.name else "Point"
             wx, wy = self.viewer.img_to_world(QPointF(*obj.points[0]))
             return f"{icon}{name}  ({wx:.4f}, {wy:.4f})"
-        if obj.kind in ("distance", "polyline"):
-            return f"{icon}{name}: {obj.value:.4g} {obj.unit}"
-        if obj.kind == "angle":
-            return f"{icon}{name}: {obj.value:.2f}°"
-        if obj.kind == "area":
-            return f"{icon}{name}: {obj.value:.4g} {obj.unit}²"
-        return f"{icon}{name}"
+        return obj.list_label()
 
     # ------------------------------------------------------------------
     # Right-panel list context menu
@@ -682,6 +676,24 @@ class MainWindow(QMainWindow):
     # File operations
     # ------------------------------------------------------------------
 
+    def new_document(self):
+        """Unload the current drawing + session (fresh start)."""
+        idx = self.viewer.current_tab_index
+        if idx < 0:
+            return
+        if self.viewer.tab_has_session_state(idx):
+            reply = QMessageBox.question(
+                self, "New",
+                "Start a new document?\n\nThe current drawing and its measurements "
+                "will be unloaded. Save the session first if you want to keep them.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.viewer.close_tab(idx)
+        self._refresh_ui_for_active_tab()
+
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Image or PDF", self._last_open_dir,
@@ -781,7 +793,7 @@ class MainWindow(QMainWindow):
             "• Open images (PNG, JPEG, BMP, TIFF) and multi-page PDFs<br>"
             "• Pan and zoom · middle-click or scroll · Zoom Rectangle (Z)<br>"
             "• Set origin and scale (by distance or coordinates)<br>"
-            "• Add labelled points, lines, angles, areas, and polylines<br>"
+            "• Add labelled points, lines, angles, polygons, polylines, ellipses, text<br>"
             "• Draw polyline / point risk contours with merged same-label levels<br>"
             "• On-canvas legend (editable title) · toggle labels · per-object colors<br>"
             "• Annotations persist on canvas with labels<br>"
@@ -789,7 +801,7 @@ class MainWindow(QMainWindow):
             "• Drag vertex handles directly when an object is selected<br>"
             "• Right-click a vertex to delete it · right-click an edge to insert<br>"
             "• Shift-lock to cardinal directions while measuring<br>"
-            "• Double-click to finish area or polyline<br>"
+            "• Double-click to finish polygon or polyline<br>"
             "• Undo / Redo · save and load sessions · export CSV/JSON<br><br>"
             "Built with PySide6 and PyMuPDF.",
         )
