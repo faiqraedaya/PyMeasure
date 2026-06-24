@@ -4,19 +4,12 @@ A desktop GUI for making precise measurements on images and PDFs — set a real-
 labelled objects, and measure distances, angles, polygon area/perimeter, and polyline lengths.
 
 ## Features
-
+- Interactive GUI built with PySide6
 - Open PNG, JPEG, BMP, TIFF images and multi-page PDFs
 - Set coordinate origin and scale (by known distance or known point coordinates)
 - Add labelled points, lines, angles, polygons, polylines, ellipses, and text boxes
 - Draw **risk contours** around a polyline or point: each contour defines up to 20
   levels (reference value, distance, color) and renders smooth rounded boundaries
-
-## Requirements
-
-- Python 3.13+
-- PySide6 >= 6.5
-- PyMuPDF >= 1.23
-- Shapely >= 2.0
 
 ## Installation
 
@@ -31,9 +24,6 @@ uv sync
 ```bash
 uv run main.py
 ```
-
-The application opens with a blank canvas. Use **File → Open** (`Ctrl+O`) to load an image or PDF,
-then set a scale before placing measurements.
 
 ## Keyboard shortcuts
 
