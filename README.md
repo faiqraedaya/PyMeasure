@@ -23,13 +23,13 @@ labelled objects, and measure distances, angles, polygon area/perimeter, and pol
 ```bash
 git clone https://github.com/faiqraedaya/PyMeasure
 cd PyMeasure
-uv pip sync
+uv sync
 ```
 
 ## Quick start
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 The application opens with a blank canvas. Use **File → Open** (`Ctrl+O`) to load an image or PDF,
