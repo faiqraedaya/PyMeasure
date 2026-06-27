@@ -78,7 +78,7 @@ class DiagramObject:
     measures: dict = field(default_factory=dict)
 
     _ICONS = {
-        "point": "●", "distance": "─ ", "angle": "∠ ", "polygon": "▣ ",
+        "point": "● ", "distance": "─ ", "angle": "∠ ", "polygon": "▣ ",
         "polyline": "〜 ", "ellipse": "◯ ", "textbox": "❏ ",
         "polyline_contour": "◠ ", "point_contour": "◎ ",
     }

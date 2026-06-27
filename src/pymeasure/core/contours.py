@@ -14,6 +14,9 @@ from shapely.ops import unary_union
 # Number of segments per quarter circle when buffering (smoothness of arcs).
 _QUAD_SEGS = 16
 
+# Stroke width used when a contour level doesn't define its own.
+DEFAULT_CONTOUR_WIDTH = 2.0
+
 # (exterior, interiors): exterior is a list of (x, y); interiors is a list of
 # rings, each a list of (x, y).
 Polygon = Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]
@@ -75,9 +78,9 @@ def build_contour_groups(contour_objs: list, scale_factor: float) -> list:
     Matching is case-insensitive and whitespace-normalized (see `_ref_key`), so
     contours sharing the same label merge into one outer boundary even if typed
     with different case/spacing. Distances (world units) are converted to pixels
-    via `scale_factor` (world units per pixel). The displayed reference and color
-    for a group come from the first level that defines it (insertion order), so
-    the legend maps reference -> one color.
+    via `scale_factor` (world units per pixel). The displayed reference, color
+    and stroke width for a group come from the first level that defines it
+    (insertion order), so the legend maps reference -> one color/width.
     """
     sf = scale_factor if scale_factor and scale_factor > 0 else 1.0
 
@@ -85,6 +88,7 @@ def build_contour_groups(contour_objs: list, scale_factor: float) -> list:
     geoms: dict = {}        # key -> [shapely geoms]
     display: dict = {}      # key -> first-seen reference label (for the legend)
     colors: dict = {}       # key -> color of first level seen
+    widths: dict = {}       # key -> stroke width of first level seen
 
     for obj in contour_objs:
         for level in obj.levels:
@@ -99,6 +103,8 @@ def build_contour_groups(contour_objs: list, scale_factor: float) -> list:
                 geoms[key] = []
                 display[key] = ref
                 colors[key] = level.get("color", "#ff0000")
+                w = float(level.get("width", 0.0) or 0.0)
+                widths[key] = w if w > 0 else DEFAULT_CONTOUR_WIDTH
                 order.append(key)
             geoms[key].append(geom)
 
@@ -111,6 +117,7 @@ def build_contour_groups(contour_objs: list, scale_factor: float) -> list:
         groups.append({
             "reference": display[key],
             "color": colors[key],
+            "width": widths[key],
             "polygons": polygons,
         })
     return groups

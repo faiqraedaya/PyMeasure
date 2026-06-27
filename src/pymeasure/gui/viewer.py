@@ -3,7 +3,7 @@ import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from PySide6.QtCore import Qt, QPointF, QRect, QRectF, Signal
@@ -12,7 +12,7 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QMenu, QMessageBox, QPlainTextEdit, QSizePolicy,
+    QApplication, QDialog, QMenu, QPlainTextEdit, QSizePolicy,
     QTabBar, QWidget,
 )
 
@@ -26,6 +26,7 @@ from ..core.models import DiagramObject, Point, ScaleInfo
 
 _HIT_R      = 8   # hit-test radius in screen pixels
 _DRAG_THRESH = 4  # pixels before a press becomes a drag
+_MAX_UNDO   = 100 # maximum retained undo steps (per page)
 
 _KIND_COLOR = {
     "point":    QColor("#4488ff"),
@@ -162,21 +163,15 @@ class _InlineTextEditor(QPlainTextEdit):
 
 
 # ---------------------------------------------------------------------------
+# PageState — per-page annotation + measurement state
 # DocumentTab — per-document state held by ImageViewer
 # ---------------------------------------------------------------------------
 
 @dataclass
-class DocumentTab:
-    """All state that belongs to a single opened document (image or PDF)."""
-    file_path: str = ""
-    pixmap: Optional[QPixmap] = None
-    pdf_doc: object = None              # fitz.Document or None
-    pdf_page_index: int = 0
-    pdf_dpi: int = 150
-
-    zoom: float = 1.0
-    pan: QPointF = field(default_factory=QPointF)
-
+class PageState:
+    """All annotation / measurement state that belongs to a single page. An
+    image has exactly one page (index 0); a PDF has one PageState per page so
+    annotations, scale, origin and history are kept independent per page."""
     origin: Point = field(default_factory=lambda: Point(0.0, 0.0))
     origin_world: Tuple[float, float] = (0.0, 0.0)
     scale_info: ScaleInfo = field(default_factory=lambda: ScaleInfo(1.0, 1.0, "px"))
@@ -191,7 +186,36 @@ class DocumentTab:
     legend_title: str = "Legend"
     legend_visible: bool = True
 
+
+@dataclass
+class DocumentTab:
+    """All state that belongs to a single opened document (image or PDF). Page
+    annotations live in `pages` (keyed by page index); everything here is shared
+    across the document's pages (the open file, current view, PDF handle)."""
+    file_path: str = ""
+    pixmap: Optional[QPixmap] = None
+    pdf_doc: object = None              # fitz.Document or None
+    pdf_page_index: int = 0
+    pdf_dpi: int = 150
+
+    zoom: float = 1.0
+    pan: QPointF = field(default_factory=QPointF)
+
+    pages: Dict[int, PageState] = field(default_factory=dict)
+
     session_path: Optional[str] = None
+
+    def page(self, index: int) -> PageState:
+        """Return the PageState for `index`, creating it on first access."""
+        ps = self.pages.get(index)
+        if ps is None:
+            ps = PageState()
+            self.pages[index] = ps
+        return ps
+
+    @property
+    def current_page_state(self) -> PageState:
+        return self.page(self.pdf_page_index)
 
     def display_label(self) -> str:
         if not self.file_path:
@@ -220,8 +244,6 @@ class ImageViewer(QWidget):
 
     # Tab lifecycle
     tab_changed          = Signal(int)     # active tab index changed (or -1)
-    tab_added            = Signal(int)
-    tab_closed           = Signal(int)
     tab_close_requested  = Signal(int)     # user clicked X — MainWindow decides
 
     def __init__(self, parent=None):
@@ -312,6 +334,12 @@ class ImageViewer(QWidget):
         return None
 
     @property
+    def _page(self) -> Optional[PageState]:
+        """The active document's currently-shown page state (or None)."""
+        a = self._active
+        return a.current_page_state if a is not None else None
+
+    @property
     def _pixmap(self) -> Optional[QPixmap]:
         return self._active.pixmap if self._active else None
     @_pixmap.setter
@@ -361,83 +389,83 @@ class ImageViewer(QWidget):
 
     @property
     def origin(self) -> Point:
-        return self._active.origin if self._active else Point(0.0, 0.0)
+        return self._page.origin if self._page else Point(0.0, 0.0)
     @origin.setter
     def origin(self, val):
-        if self._active is not None:
-            self._active.origin = val
+        if self._page is not None:
+            self._page.origin = val
 
     @property
     def _origin_world(self) -> Tuple[float, float]:
-        return self._active.origin_world if self._active else (0.0, 0.0)
+        return self._page.origin_world if self._page else (0.0, 0.0)
     @_origin_world.setter
     def _origin_world(self, val):
-        if self._active is not None:
-            self._active.origin_world = val
+        if self._page is not None:
+            self._page.origin_world = val
 
     @property
     def scale_info(self) -> ScaleInfo:
-        return self._active.scale_info if self._active else ScaleInfo(1.0, 1.0, "px")
+        return self._page.scale_info if self._page else ScaleInfo(1.0, 1.0, "px")
     @scale_info.setter
     def scale_info(self, val):
-        if self._active is not None:
-            self._active.scale_info = val
+        if self._page is not None:
+            self._page.scale_info = val
 
     @property
     def _temp(self) -> List[Point]:
-        return self._active.temp if self._active else []
+        return self._page.temp if self._page else []
     @_temp.setter
     def _temp(self, val):
-        if self._active is not None:
-            self._active.temp = val
+        if self._page is not None:
+            self._page.temp = val
 
     @property
     def objects(self) -> List[DiagramObject]:
-        return self._active.objects if self._active else []
+        return self._page.objects if self._page else []
     @objects.setter
     def objects(self, val):
-        if self._active is not None:
-            self._active.objects = val
+        if self._page is not None:
+            self._page.objects = val
 
     @property
     def _selection(self) -> set:
-        return self._active.selection if self._active else set()
+        return self._page.selection if self._page else set()
     @_selection.setter
     def _selection(self, val):
-        if self._active is not None:
-            self._active.selection = val
+        if self._page is not None:
+            self._page.selection = val
 
     @property
     def _undo_stack(self) -> List[dict]:
-        return self._active.undo_stack if self._active else []
+        return self._page.undo_stack if self._page else []
     @_undo_stack.setter
     def _undo_stack(self, val):
-        if self._active is not None:
-            self._active.undo_stack = val
+        if self._page is not None:
+            self._page.undo_stack = val
 
     @property
     def _redo_stack(self) -> List[dict]:
-        return self._active.redo_stack if self._active else []
+        return self._page.redo_stack if self._page else []
     @_redo_stack.setter
     def _redo_stack(self, val):
-        if self._active is not None:
-            self._active.redo_stack = val
+        if self._page is not None:
+            self._page.redo_stack = val
 
     @property
     def legend_title(self) -> str:
-        return self._active.legend_title if self._active else "Legend"
+        return self._page.legend_title if self._page else "Legend"
     @legend_title.setter
     def legend_title(self, val):
-        if self._active is not None:
-            self._active.legend_title = val
+        if self._page is not None:
+            self._page.legend_title = val
 
     @property
     def legend_visible(self) -> bool:
-        return self._active.legend_visible if self._active else True
+        return self._page.legend_visible if self._page else True
     @legend_visible.setter
     def legend_visible(self, val):
-        if self._active is not None:
-            self._active.legend_visible = val
+        if self._page is not None:
+            self._page.legend_visible = val
 
     # ------------------------------------------------------------------
     # Tab management
@@ -466,10 +494,6 @@ class ImageViewer(QWidget):
         if self._active is not None:
             self._active.session_path = path
 
-    def tabs_iter(self):
-        """Iterate (index, DocumentTab) for all tabs."""
-        return enumerate(self._tabs)
-
     def add_tab(self, file_path: str = "", activate: bool = True) -> int:
         """Create a new (empty) tab and optionally make it active."""
         tab = DocumentTab(file_path=file_path)
@@ -482,7 +506,6 @@ class ImageViewer(QWidget):
         self._tab_bar.show()
         self._suppress_tab_signal = False
 
-        self.tab_added.emit(idx)
         if activate:
             self.set_current_tab(idx)
         self._update_geometry()
@@ -509,7 +532,6 @@ class ImageViewer(QWidget):
             self._active_idx = -1
             self._tab_bar.hide()
             self._cancel_transient_interactions()
-            self.tab_closed.emit(idx)
             self.tab_changed.emit(-1)
             self.update()
             self._update_geometry()
@@ -521,7 +543,6 @@ class ImageViewer(QWidget):
             new_active = min(idx, len(self._tabs) - 1)
         self._active_idx = new_active
         self._cancel_transient_interactions()
-        self.tab_closed.emit(idx)
         self.tab_changed.emit(self._active_idx)
         self.update()
         self._update_geometry()
@@ -652,9 +673,9 @@ class ImageViewer(QWidget):
         self.update()
 
     def set_legend_visible(self, visible: bool):
-        if self._active is None or self._active.legend_visible == visible:
+        if self._page is None or self._page.legend_visible == visible:
             return
-        self._active.legend_visible = visible
+        self._page.legend_visible = visible
         self.update()
 
     def edit_legend_title(self):
@@ -775,16 +796,16 @@ class ImageViewer(QWidget):
         clamped = max(0, min(index, len(self._pdf_doc) - 1))
         if clamped == self._pdf_page_index:
             return
+        # Commit any in-progress edit and drop drag state that refers to the
+        # current page's objects before switching to the new page's state.
+        self._cancel_transient_interactions()
         self._pdf_page_index = clamped
         if self._render_pdf_page():
             if self._active is not None:
                 self.refresh_tab_label(self._active_idx)
-            self.update()
-
-    def set_pdf_dpi(self, dpi: int):
-        self._pdf_dpi = max(72, min(600, dpi))
-        if self._pdf_doc is not None:
-            self._render_pdf_page()
+            # The active page's annotations / scale / origin / legend all changed;
+            # state_restored prompts the window to resync its panels.
+            self.state_restored.emit()
             self.update()
 
     # ------------------------------------------------------------------
@@ -944,13 +965,21 @@ class ImageViewer(QWidget):
                 self._paint_ellipse(painter, obj, selected)
             elif obj.kind == "textbox":
                 self._paint_textbox(painter, obj, selected)
-            elif obj.kind == "polyline_contour":
-                self._paint_contour_skeleton(painter, obj, selected, closed=False)
-            elif obj.kind == "point_contour":
-                self._paint_contour_skeleton(painter, obj, selected, closed=False)
+            elif obj.kind in ("polyline_contour", "point_contour"):
+                self._paint_contour_skeleton(painter, obj, selected)
 
             if selected and obj.kind not in ("point", "point_contour"):
                 self._paint_vertex_handles(painter, obj.points)
+
+    def _label_color(self, obj: DiagramObject, selected: bool) -> QColor:
+        """Colour for an object's on-canvas text label: the selection colour when
+        selected, otherwise the object's own colour (falling back to the kind
+        default, then a neutral label colour)."""
+        if selected:
+            return _SEL_COLOR
+        if obj.color:
+            return QColor(obj.color)
+        return _KIND_COLOR.get(obj.kind, _LABEL_COLOR)
 
     def _paint_point(self, painter, obj, idx, selected):
         if not obj.points:
@@ -965,21 +994,22 @@ class ImageViewer(QWidget):
         if not self._show_labels:
             return
         label = obj.name or f"P{idx + 1}"
-        painter.setPen(_LABEL_COLOR)
+        painter.setPen(self._label_color(obj, selected))
         painter.drawText(QPointF(sp.x() + 9, sp.y() - 7), label)
         wx, wy = self.img_to_world(QPointF(*obj.points[0]))
-        painter.setPen(_LABEL_COLOR)
         painter.drawText(QPointF(sp.x() + 9, sp.y() + 6), f"({wx:.2f}, {wy:.2f})")
 
-    def _paint_obj_label(self, painter, anchor: QPointF, obj, fallback: str):
+    def _paint_obj_label(self, painter, anchor: QPointF, obj, fallback: str,
+                         selected: bool = False):
         """Draw an object's name + all its measurements near `anchor` (baseline
         of the first line). A single measurement reads 'Name: value'; multiple
-        measurements are listed one per line under the name."""
+        measurements are listed one per line under the name. The text is drawn in
+        the object's own colour (red when selected)."""
         if not self._show_labels:
             return
         name = obj.name or fallback
         ms = obj.measurements()
-        painter.setPen(_LABEL_COLOR)
+        painter.setPen(self._label_color(obj, selected))
         if len(ms) <= 1:
             text = f"{name}: {ms[0][1]}" if ms else name
             painter.drawText(anchor, text)
@@ -998,7 +1028,7 @@ class ImageViewer(QWidget):
         painter.setPen(self._obj_pen(obj, selected))
         painter.drawLine(sp0, sp1)
         mid = QPointF((sp0.x() + sp1.x()) / 2, (sp0.y() + sp1.y()) / 2)
-        self._paint_obj_label(painter, QPointF(mid.x() + 5, mid.y() - 5), obj, "Line")
+        self._paint_obj_label(painter, QPointF(mid.x() + 5, mid.y() - 5), obj, "Line", selected)
 
     def _paint_angle(self, painter, obj, selected):
         if len(obj.points) < 3:
@@ -1007,7 +1037,7 @@ class ImageViewer(QWidget):
         painter.setPen(self._obj_pen(obj, selected))
         painter.drawLine(sp[0], sp[1])
         painter.drawLine(sp[2], sp[1])
-        self._paint_obj_label(painter, QPointF(sp[1].x() + 5, sp[1].y() - 5), obj, "Angle")
+        self._paint_obj_label(painter, QPointF(sp[1].x() + 5, sp[1].y() - 5), obj, "Angle", selected)
 
     def _paint_polygon(self, painter, obj, selected):
         if len(obj.points) < 3:
@@ -1022,7 +1052,7 @@ class ImageViewer(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         cx = sum(s.x() for s in sps) / len(sps)
         cy = sum(s.y() for s in sps) / len(sps)
-        self._paint_obj_label(painter, QPointF(cx + 5, cy), obj, "Polygon")
+        self._paint_obj_label(painter, QPointF(cx + 5, cy), obj, "Polygon", selected)
 
     def _paint_polyline(self, painter, obj, selected):
         if len(obj.points) < 2:
@@ -1032,7 +1062,7 @@ class ImageViewer(QWidget):
         for i in range(len(sps) - 1):
             painter.drawLine(sps[i], sps[i + 1])
         mid = sps[len(sps) // 2]
-        self._paint_obj_label(painter, QPointF(mid.x() + 5, mid.y() - 5), obj, "Polyline")
+        self._paint_obj_label(painter, QPointF(mid.x() + 5, mid.y() - 5), obj, "Polyline", selected)
 
     def _paint_ellipse(self, painter, obj, selected):
         if len(obj.points) < 2:
@@ -1048,7 +1078,7 @@ class ImageViewer(QWidget):
         painter.setPen(self._obj_pen(obj, selected))
         painter.drawEllipse(rect)
         self._paint_obj_label(painter, QPointF(rect.center().x() + 5, rect.top() - 5),
-                              obj, "Ellipse")
+                              obj, "Ellipse", selected)
 
     def _paint_textbox(self, painter, obj, selected):
         if len(obj.points) < 2:
@@ -1090,7 +1120,7 @@ class ImageViewer(QWidget):
                              int(align | Qt.TextFlag.TextWordWrap),
                              obj.text)
 
-    def _paint_contour_skeleton(self, painter, obj, selected, closed=False):
+    def _paint_contour_skeleton(self, painter, obj, selected):
         """Thin dashed defining geometry (polyline or single point) of a contour
         object, so it is visible and selectable. The contour rings themselves are
         drawn separately (merged) in _paint_contours."""
@@ -1108,7 +1138,7 @@ class ImageViewer(QWidget):
             for i in range(len(sps) - 1):
                 painter.drawLine(sps[i], sps[i + 1])
         if self._show_labels and obj.name:
-            painter.setPen(_LABEL_COLOR)
+            painter.setPen(color)
             painter.drawText(QPointF(sps[0].x() + 7, sps[0].y() - 6), obj.name)
 
     def _paint_vertex_handles(self, painter: QPainter, points: list):
@@ -1234,6 +1264,7 @@ class ImageViewer(QWidget):
                 tuple((round(x, 3), round(y, 3)) for x, y in obj.points),
                 tuple((str(l.get("reference", "")),
                        round(float(l.get("distance", 0) or 0), 6),
+                       round(float(l.get("width", 0) or 0), 3),
                        l.get("color", "")) for l in obj.levels),
             ))
         return tuple(sig)
@@ -1258,7 +1289,7 @@ class ImageViewer(QWidget):
             return
         painter.setBrush(Qt.BrushStyle.NoBrush)   # no fill, line only
         for g in groups:
-            painter.setPen(QPen(QColor(g["color"]), 2))
+            painter.setPen(QPen(QColor(g["color"]), g.get("width", 2)))
             for exterior, interiors in g["polygons"]:
                 self._draw_ring(painter, exterior)
                 for hole in interiors:
@@ -1311,7 +1342,10 @@ class ImageViewer(QWidget):
         painter.setFont(base_font)
         for idx, g in enumerate(groups, start=1):
             line_top = y + pad + line_h * idx
-            painter.setPen(QPen(QColor(g["color"]), 3))
+            # Swatch reflects the contour's width, clamped so a thick line
+            # doesn't overflow the legend row.
+            sw = max(1.0, min(float(g.get("width", 3) or 3), float(fm.height())))
+            painter.setPen(QPen(QColor(g["color"]), sw))
             sw_y = line_top + fm.height() / 2.0
             painter.drawLine(QPointF(content_x, sw_y),
                              QPointF(content_x + swatch_w, sw_y))
@@ -1478,9 +1512,12 @@ class ImageViewer(QWidget):
             self.update()
             return
 
-        # Update hover cursor
+        # Update the hover cursor. Only repaint when there is a live drawing
+        # preview to refresh — idle hover (no in-progress object) doesn't change
+        # the canvas, so repainting the whole image every mouse move is wasteful.
         self._update_cursor_for_pos(pos)
-        self.update()
+        if self._temp:
+            self.update()
 
     def mouseReleaseEvent(self, event):
         btn = event.button()
@@ -1494,8 +1531,7 @@ class ImageViewer(QWidget):
             return
 
         if self._vtx_drag_active and btn == Qt.MouseButton.LeftButton:
-            self._undo_stack.append(self._vtx_drag_snap)
-            self._redo_stack.clear()
+            self._record_undo(self._vtx_drag_snap)
             self._recalculate_object(self.objects[self._vtx_drag_obj])
             self._vtx_drag_active = False
             self._vtx_drag_vtx    = -1
@@ -1507,8 +1543,7 @@ class ImageViewer(QWidget):
 
         if btn == Qt.MouseButton.LeftButton and self.current_tool in (Tool.PAN, Tool.SELECT):
             if self._sel_drag_active:
-                self._undo_stack.append(self._sel_drag_snap)
-                self._redo_stack.clear()
+                self._record_undo(self._sel_drag_snap)
                 self._sel_drag_active = False
                 self._sel_press_obj   = -1
                 self._sel_press_pos   = None
@@ -1591,11 +1626,11 @@ class ImageViewer(QWidget):
                 self._temp.clear()
                 self.update()
 
-        elif key == Qt.Key.Key_Delete and self.current_tool == Tool.PAN and self._selection:
-            self.delete_requested.emit()
-
+        # Arrow-key nudge of the selection (no menu shortcut owns these). Delete,
+        # cut/copy/paste and select-all are handled by the Edit-menu shortcuts,
+        # which intercept those keys before they reach this widget.
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down) \
-                and self.current_tool == Tool.PAN and self._selection:
+                and self.current_tool in (Tool.PAN, Tool.SELECT) and self._selection:
             step = 10.0 if (mods & Qt.KeyboardModifier.ShiftModifier) else 1.0
             dx = -step if key == Qt.Key.Key_Left else step if key == Qt.Key.Key_Right else 0.0
             dy = -step if key == Qt.Key.Key_Up   else step if key == Qt.Key.Key_Down  else 0.0
@@ -1604,17 +1639,6 @@ class ImageViewer(QWidget):
         elif key == Qt.Key.Key_Shift:
             self.update()
 
-        elif mods & Qt.KeyboardModifier.ControlModifier:
-            if key == Qt.Key.Key_C:
-                self.copy_selection()
-            elif key == Qt.Key.Key_X:
-                self.cut_selection()
-            elif key == Qt.Key.Key_V:
-                self.paste()
-            elif key == Qt.Key.Key_A:
-                self.select_all()
-            else:
-                super().keyPressEvent(event)
         else:
             super().keyPressEvent(event)
 
@@ -1717,7 +1741,7 @@ class ImageViewer(QWidget):
         base = name if name else ""
         return f"{base} - Copy" if base else "Copy"
 
-    def duplicate_selection(self, screen_pos: Optional[QPointF] = None):
+    def duplicate_selection(self):
         """Duplicate currently-selected objects at the same coordinates."""
         if not self._selection:
             return
@@ -1939,9 +1963,9 @@ class ImageViewer(QWidget):
             self.update()
             return
 
-        # Zoom so the rect fills 95% of the viewport
-        vw = self.width() or 800
-        vh = self.height() or 600
+        # Zoom so the rect fills 95% of the canvas (the area below the tab bar)
+        vw = self._canvas_width() or 800
+        vh = self._canvas_height() or 600
         new_zoom = min(vw / img_w, vh / img_h) * 0.95
         new_zoom = max(0.05, min(20.0, new_zoom))
 
@@ -2370,10 +2394,11 @@ class ImageViewer(QWidget):
     # Measurement recalculation
     # ------------------------------------------------------------------
 
-    def _recalculate_object(self, obj: DiagramObject):
+    def _recalculate_object(self, obj: DiagramObject, scale_info: Optional[ScaleInfo] = None):
+        si = scale_info if scale_info is not None else self.scale_info
         pts = [Point(x, y) for x, y in obj.points]
-        sf  = self.scale_info.scale_factor
-        unit = self.scale_info.unit
+        sf  = si.scale_factor
+        unit = si.unit
         if obj.kind == "distance" and len(pts) == 2:
             length = pts[0].distance_to(pts[1]) * sf
             obj.value = length
@@ -2514,9 +2539,8 @@ class ImageViewer(QWidget):
         elif tool == Tool.SET_SCALE_COORDS:
             dlg = ScaleCoordsDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                import math as _m
                 (x1, y1, x2, y2), unit = dlg.values()
-                real_dist = _m.hypot(x2 - x1, y2 - y1)
+                real_dist = math.hypot(x2 - x1, y2 - y1)
                 self._push_undo()
                 self.scale_info = ScaleInfo(pixel_dist, real_dist, unit)
                 self._recalculate_all()
@@ -2715,9 +2739,16 @@ class ImageViewer(QWidget):
             "legend_title": self.legend_title,
         }
 
-    def _push_undo(self):
-        self._undo_stack.append(self._snapshot())
+    def _record_undo(self, snap: dict):
+        """Push `snap` onto the undo stack (capped at _MAX_UNDO) and clear redo."""
+        stack = self._undo_stack
+        stack.append(snap)
+        if len(stack) > _MAX_UNDO:
+            del stack[:len(stack) - _MAX_UNDO]
         self._redo_stack.clear()
+
+    def _push_undo(self):
+        self._record_undo(self._snapshot())
 
     def _restore(self, snap: dict):
         self.origin        = Point(*snap["origin"])
@@ -2746,71 +2777,140 @@ class ImageViewer(QWidget):
     # Session
     # ------------------------------------------------------------------
 
-    def reset_session(self):
-        """Clear the active tab's session state: objects, selection, scale, origin, history."""
-        if self._active is None:
-            return
-        self.objects.clear()
-        self._selection.clear()
-        self._temp.clear()
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self.origin        = Point(0.0, 0.0)
-        self._origin_world = (0.0, 0.0)
-        self.scale_info    = ScaleInfo(1.0, 1.0, "px")
-        self.legend_title  = "Legend"
-        self._cancel_transient_interactions()
-        self.set_current_tab_session_path(None)
-        self.selection_changed.emit([])
-        self.scale_set.emit(self.scale_info)
-        self.origin_set.emit(self.origin)
-        self.objects_changed.emit()
-        self.update()
-
-    def has_session_state(self) -> bool:
-        """Return True if the active tab has any annotation / scale / origin worth preserving."""
-        if self._active is None:
-            return False
-        return self._tab_has_session_state(self._active)
-
     @staticmethod
-    def _tab_has_session_state(tab: DocumentTab) -> bool:
-        if tab.objects:
+    def _page_state_has_data(ps: PageState) -> bool:
+        """True if a page carries any annotation / scale / origin / legend state
+        worth preserving (i.e. it differs from a pristine page)."""
+        if ps.objects:
             return True
-        if tab.origin_world != (0.0, 0.0):
+        if ps.origin_world != (0.0, 0.0):
             return True
-        if tab.origin.x != 0.0 or tab.origin.y != 0.0:
+        if ps.origin.x != 0.0 or ps.origin.y != 0.0:
             return True
-        si = tab.scale_info
+        si = ps.scale_info
         if si.unit != "px" or si.pixel_distance != 1.0 or si.real_distance != 1.0:
             return True
+        if ps.legend_title != "Legend" or not ps.legend_visible:
+            return True
         return False
+
+    @classmethod
+    def _tab_has_session_state(cls, tab: DocumentTab) -> bool:
+        return any(cls._page_state_has_data(ps) for ps in tab.pages.values())
 
     def tab_has_session_state(self, idx: int) -> bool:
         if 0 <= idx < len(self._tabs):
             return self._tab_has_session_state(self._tabs[idx])
         return False
 
-    def session_data(self) -> dict:
+    @staticmethod
+    def _page_state_to_dict(ps: PageState) -> dict:
         return {
-            "scale_info":   self.scale_info.to_dict(),
-            "origin":       self.origin.to_dict(),
-            "origin_world": list(self._origin_world),
-            "objects":      [o.to_dict() for o in self.objects],
-            "legend_title": self.legend_title,
+            "scale_info":     ps.scale_info.to_dict(),
+            "origin":         ps.origin.to_dict(),
+            "origin_world":   list(ps.origin_world),
+            "objects":        [o.to_dict() for o in ps.objects],
+            "legend_title":   ps.legend_title,
+            "legend_visible": ps.legend_visible,
         }
 
-    def _recompute_missing_measures(self):
-        """Backfill derived measurements for objects that lack them (e.g. loaded
-        from an older session that only stored a single `value`)."""
-        for obj in self.objects:
+    def session_data(self) -> dict:
+        """Serialize the active document: one entry per page that holds state,
+        plus the current page and view so a reload restores exactly what was
+        on screen."""
+        tab = self._active
+        if tab is None:
+            return {"version": 2, "pages": {}}
+        pages = {
+            str(idx): self._page_state_to_dict(ps)
+            for idx, ps in sorted(tab.pages.items())
+            if self._page_state_has_data(ps)
+        }
+        return {
+            "version":      2,
+            "current_page": tab.pdf_page_index,
+            "zoom":         tab.zoom,
+            "pan":          [tab.pan.x(), tab.pan.y()],
+            "pages":        pages,
+        }
+
+    def _recompute_missing_measures_for(self, ps: PageState):
+        """Backfill derived measurements for a page's objects that lack them
+        (e.g. loaded from an older session that only stored a single `value`)."""
+        for obj in ps.objects:
             if obj.kind in ("point", "textbox") or obj.is_contour:
                 continue
             if not obj.measures:
-                self._recalculate_object(obj)
+                self._recalculate_object(obj, ps.scale_info)
+
+    def _recompute_missing_measures(self):
+        if self._page is not None:
+            self._recompute_missing_measures_for(self._page)
 
     def load_session(self, data: dict, progress=None):
-        """Load a session. Optional `progress(current, total)` callback."""
+        """Load a session into the active tab. Supports the multi-page v2 format
+        as well as the legacy single-page formats. Optional
+        `progress(current, total)` callback reports object-load progress."""
+        if self._active is None:
+            return
+        if "pages" in data:
+            self._load_multi_page_session(self._active, data, progress)
+        else:
+            self._load_legacy_session(data, progress)
+        self._temp.clear()
+        self._selection.clear()
+        self.update()
+
+    def _load_multi_page_session(self, tab: DocumentTab, data: dict, progress=None):
+        raw_pages = data.get("pages", {}) or {}
+        total = sum(len(pd.get("objects", [])) for pd in raw_pages.values())
+        done = 0
+        tab.pages.clear()
+        for key, pd in raw_pages.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            ps = PageState()
+            ps.scale_info     = ScaleInfo.from_dict(pd["scale_info"])
+            ps.origin         = Point.from_dict(pd["origin"])
+            ow                = pd.get("origin_world", [0.0, 0.0])
+            ps.origin_world   = (float(ow[0]), float(ow[1]))
+            ps.legend_title   = pd.get("legend_title", "Legend")
+            ps.legend_visible = bool(pd.get("legend_visible", True))
+            for o in pd.get("objects", []):
+                ps.objects.append(DiagramObject.from_dict(o))
+                done += 1
+                if progress is not None and (done % 25 == 0 or done == total):
+                    progress(done, total)
+            self._recompute_missing_measures_for(ps)
+            tab.pages[idx] = ps
+        if progress is not None and total == 0:
+            progress(0, 0)
+
+        # Restore the viewed page (clamped to the document) and the saved view.
+        cur = int(data.get("current_page", 0) or 0)
+        if tab.pdf_doc is not None:
+            cur = max(0, min(cur, len(tab.pdf_doc) - 1))
+        else:
+            cur = 0
+        tab.pdf_page_index = cur
+        self._render_pdf_page()   # no-op for images; re-renders the PDF page
+        try:
+            tab.zoom = max(0.05, min(20.0, float(data["zoom"])))
+        except (KeyError, TypeError, ValueError):
+            pass
+        pan = data.get("pan")
+        if isinstance(pan, (list, tuple)) and len(pan) == 2:
+            try:
+                tab.pan = QPointF(float(pan[0]), float(pan[1]))
+            except (TypeError, ValueError):
+                pass
+        self.refresh_tab_label(self._active_idx)
+        self.zoom_changed.emit(tab.zoom)
+
+    def _load_legacy_session(self, data: dict, progress=None):
+        """Load an older single-page session into the active page."""
         self.scale_info    = ScaleInfo.from_dict(data["scale_info"])
         self.origin        = Point.from_dict(data["origin"])
         ow                 = data.get("origin_world", [0.0, 0.0])
@@ -2844,6 +2944,3 @@ class ImageViewer(QWidget):
                     progress(idx + 1, total)
 
         self._recompute_missing_measures()
-        self._temp.clear()
-        self._selection.clear()
-        self.update()

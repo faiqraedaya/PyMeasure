@@ -97,6 +97,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._add_action(file_menu, "&Export Data…",  "Ctrl+E",        self.show_export)
         self._add_action(file_menu, "Export &View as Image…", "Ctrl+Shift+E", self.export_view_image)
+        self._add_action(file_menu, "Snapshot View to &Clipboard", "Ctrl+Shift+C", self.snapshot_view_to_clipboard)
         file_menu.addSeparator()
         self._add_action(file_menu, "&Quit",          "Ctrl+Q",        self.close)
 
@@ -557,7 +558,7 @@ class MainWindow(QMainWindow):
                 self.viewer.set_selection([idx])
                 self.selection_changed_via_panel(idx)
             menu.addAction("Edit…", lambda: self.viewer.open_edit_dialog_for(idx))
-            menu.addAction("Copy Coordinates", lambda: self._copy_coordinates(idx))
+            menu.addAction("Copy Coordinates", lambda: self.viewer._copy_coordinates(idx))
             menu.addSeparator()
 
         sel = sorted(self.viewer._selection)
@@ -584,14 +585,6 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
         self._syncing_selection = False
         self.viewer.update()
-
-    def _copy_coordinates(self, idx: int):
-        obj = self.viewer.objects[idx]
-        lines = ["x\ty"] + [
-            "{:.6g}\t{:.6g}".format(*self.viewer.img_to_world(QPointF(x, y)))
-            for x, y in obj.points
-        ]
-        QApplication.clipboard().setText("\n".join(lines))
 
     def _delete_single(self, idx: int):
         reply = QMessageBox.question(
@@ -784,6 +777,17 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export View", f"Could not save image to:\n{path}")
             return
         self._status_msg.setText(f"View exported to {path}")
+
+    def snapshot_view_to_clipboard(self):
+        if self.viewer.current_tab_index < 0:
+            QMessageBox.information(self, "Snapshot View", "Open an image or PDF first.")
+            return
+        pixmap = self.viewer.grab_canvas()
+        if pixmap.isNull():
+            QMessageBox.critical(self, "Snapshot View", "Could not capture the current view.")
+            return
+        QApplication.clipboard().setPixmap(pixmap)
+        self._status_msg.setText("View copied to clipboard")
 
     def show_about(self):
         QMessageBox.about(

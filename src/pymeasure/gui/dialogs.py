@@ -20,6 +20,7 @@ _CONTOUR_PALETTE = [
     "#0088ff", "#aa44ff", "#ff44aa", "#00cccc",
 ]
 MAX_CONTOUR_LEVELS = 20
+DEFAULT_CONTOUR_WIDTH = 2.0
 
 
 class ColorButton(QPushButton):
@@ -107,7 +108,8 @@ class LineStyleControls(QWidget):
 
 class ContourLevelsTable(QWidget):
     """Reusable editor for a contour object's levels: a table of
-    (reference value, distance, color) rows, capped at MAX_CONTOUR_LEVELS."""
+    (reference value, distance, width, color) rows, capped at
+    MAX_CONTOUR_LEVELS."""
 
     def __init__(self, unit="px", levels=None, parent=None):
         super().__init__(parent)
@@ -115,14 +117,15 @@ class ContourLevelsTable(QWidget):
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 3)
+        self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(
-            ["Reference value", f"Distance ({unit})", "Color"]
+            ["Reference value", f"Distance ({unit})", "Width", "Color"]
         )
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         v.addWidget(self._table)
 
         row = QHBoxLayout()
@@ -138,11 +141,11 @@ class ContourLevelsTable(QWidget):
         if levels:
             for lv in levels[:MAX_CONTOUR_LEVELS]:
                 self.add_row(lv.get("reference", ""), lv.get("distance", 0.0),
-                             lv.get("color"))
+                             lv.get("color"), lv.get("width"))
         else:
             self.add_row()
 
-    def add_row(self, reference="", distance=0.0, color=None):
+    def add_row(self, reference="", distance=0.0, color=None, width=None):
         n = self._table.rowCount()
         if n >= MAX_CONTOUR_LEVELS:
             return
@@ -155,7 +158,13 @@ class ContourLevelsTable(QWidget):
         spin.setDecimals(4)
         spin.setValue(float(distance))
         self._table.setCellWidget(n, 1, spin)
-        self._table.setCellWidget(n, 2, ColorButton(color))
+        wspin = QDoubleSpinBox()
+        wspin.setRange(0.5, 30.0)
+        wspin.setSingleStep(0.5)
+        wspin.setDecimals(1)
+        wspin.setValue(float(width) if width and float(width) > 0 else DEFAULT_CONTOUR_WIDTH)
+        self._table.setCellWidget(n, 2, wspin)
+        self._table.setCellWidget(n, 3, ColorButton(color))
 
     def remove_last(self):
         if self._table.rowCount() > 1:
@@ -168,9 +177,12 @@ class ContourLevelsTable(QWidget):
             ref = ref_item.text().strip() if ref_item else ""
             spin = self._table.cellWidget(r, 1)
             dist = spin.value() if spin else 0.0
-            cbtn = self._table.cellWidget(r, 2)
+            wspin = self._table.cellWidget(r, 2)
+            width = wspin.value() if wspin else DEFAULT_CONTOUR_WIDTH
+            cbtn = self._table.cellWidget(r, 3)
             color = cbtn.color_name() if cbtn else "#ff0000"
-            out.append({"reference": ref, "distance": dist, "color": color})
+            out.append({"reference": ref, "distance": dist,
+                        "width": width, "color": color})
         return out
 
 
