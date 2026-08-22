@@ -1103,6 +1103,9 @@ class ImageViewer(QWidget):
             and self.objects[self._inline_obj_idx] is obj
         )
         if obj.text and not editing:
+            # save/restore: the zoom-scaled font must not leak into whatever is
+            # painted next (later object labels, the legend).
+            painter.save()
             font = QFont(painter.font())
             if obj.font_family:
                 font.setFamily(obj.font_family)
@@ -1119,12 +1122,16 @@ class ImageViewer(QWidget):
             painter.drawText(rect.adjusted(4, 2, -4, -2),
                              int(align | Qt.TextFlag.TextWordWrap),
                              obj.text)
+            painter.restore()
 
     def _paint_contour_skeleton(self, painter, obj, selected):
         """Thin dashed defining geometry (polyline or single point) of a contour
         object, so it is visible and selectable. The contour rings themselves are
-        drawn separately (merged) in _paint_contours."""
+        drawn separately (merged) in _paint_contours. Hidden along with the labels
+        unless the object is selected, so the selection stays visible."""
         if not obj.points:
+            return
+        if not self._show_labels and not selected:
             return
         sps = [self._img_to_screen(QPointF(*p)) for p in obj.points]
         color = _SEL_COLOR if selected else _SKELETON_COLOR

@@ -135,7 +135,7 @@ wheels = [
 [[package]]
 name = "pymeasure"
 version = "2.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "pymupdf" },
     { name = "pyside6" },
