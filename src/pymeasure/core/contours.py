@@ -69,7 +69,8 @@ def _ref_key(reference: str) -> str:
     return " ".join(str(reference).split()).casefold()
 
 
-def build_contour_groups(contour_objs: list, scale_factor: float) -> list:
+def build_contour_groups(contour_objs: list, scale_factor: float,
+                         default_color: str = "") -> list:
     """Group contour levels across all contour objects by reference label,
     union each group, and return an ordered list of:
 
@@ -102,7 +103,10 @@ def build_contour_groups(contour_objs: list, scale_factor: float) -> list:
             if key not in geoms:
                 geoms[key] = []
                 display[key] = ref
-                colors[key] = level.get("color", "#ff0000")
+                # A level normally carries its own colour. The fallback is
+                # passed in rather than named here: core computes geometry and
+                # has no opinion about how it is drawn.
+                colors[key] = level.get("color") or default_color
                 w = float(level.get("width", 0.0) or 0.0)
                 widths[key] = w if w > 0 else DEFAULT_CONTOUR_WIDTH
                 order.append(key)

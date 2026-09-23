@@ -77,12 +77,6 @@ class DiagramObject:
     # `value`/`unit` hold the primary one for backward compatibility.
     measures: dict = field(default_factory=dict)
 
-    _ICONS = {
-        "point": "● ", "distance": "─ ", "angle": "∠ ", "polygon": "▣ ",
-        "polyline": "〜 ", "ellipse": "◯ ", "textbox": "❏ ",
-        "polyline_contour": "◠ ", "point_contour": "◎ ",
-    }
-
     @property
     def is_contour(self) -> bool:
         return self.kind in ("polyline_contour", "point_contour")
@@ -133,16 +127,20 @@ class DiagramObject:
         return ", ".join(f"{lbl} {val}" for lbl, val in ms)
 
     def list_label(self) -> str:
-        """Short label for the objects panel list."""
-        icon = self._ICONS.get(self.kind, "? ")
+        """Short label for the objects panel list.
+
+        Text only: the kind is shown by the row's icon, drawn from the app's
+        one icon family rather than by a symbol character picked from whatever
+        font happens to have one.
+        """
         name = self.name if self.name else self.kind.capitalize()
         if self.is_contour:
-            return f"{icon}{name}: {self._levels_summary()}"
+            return f"{name}: {self._levels_summary()}"
         if self.kind == "textbox":
             preview = self._text_preview()
-            return f"{icon}{name}: {preview}" if preview else f"{icon}{name}"
+            return f"{name}: {preview}" if preview else name
         inline = self._measure_inline()
-        return f"{icon}{name}: {inline}" if inline else f"{icon}{name}"
+        return f"{name}: {inline}" if inline else name
 
     def display_short(self) -> str:
         """Compact value label drawn on the canvas."""

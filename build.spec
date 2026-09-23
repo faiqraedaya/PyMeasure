@@ -1,14 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
 # Directory-bundle build for PyMeasure.
-# App imports: PySide6 (QtCore/QtGui/QtWidgets), PyMuPDF (fitz), and Shapely
-# (risk-contour geometry; pulls in numpy + the GEOS native libs). Stdlib only
-# otherwise. PyInstaller's built-in PySide6/pymupdf/numpy hooks and the
-# contributed hook-shapely (bundles geos_c.dll from shapely.libs) handle the
-# data files and native libraries automatically.
+# App imports: PySide6 (QtCore/QtGui/QtWidgets/QtSvg), PyMuPDF (fitz), and
+# Shapely (risk-contour geometry; pulls in numpy + the GEOS native libs).
+# Stdlib only otherwise. PyInstaller's built-in PySide6/pymupdf/numpy hooks and
+# the contributed hook-shapely (bundles geos_c.dll from shapely.libs) handle
+# the data files and native libraries automatically.
+#
+# QtSvg is NOT excluded: gui/icons.py renders the whole icon set from SVG path
+# data at runtime through QSvgRenderer. The bundled Inter faces ship as data
+# for the same reason - a design system that is not in the bundle is not in
+# the product.
 
-# Qt ships ~100 submodules. Exclude everything outside Core/Gui/Widgets/Network.
-# (Network stays so the QtCore hook resolves cleanly even though we don't use it.)
+# Qt ships ~100 submodules. Exclude everything outside
+# Core/Gui/Widgets/Network/Svg. (Network stays so the QtCore hook resolves
+# cleanly even though we don't use it; Svg draws every icon in the app.)
 EXCLUDED_QT = [
     'PySide6.Qt3DAnimation', 'PySide6.Qt3DCore', 'PySide6.Qt3DExtras',
     'PySide6.Qt3DInput', 'PySide6.Qt3DLogic', 'PySide6.Qt3DRender',
@@ -33,7 +39,7 @@ EXCLUDED_QT = [
     'PySide6.QtQuickTemplates2', 'PySide6.QtQuickTest', 'PySide6.QtQuickWidgets',
     'PySide6.QtRemoteObjects', 'PySide6.QtScxml', 'PySide6.QtSensors',
     'PySide6.QtSerialBus', 'PySide6.QtSerialPort', 'PySide6.QtSpatialAudio',
-    'PySide6.QtSql', 'PySide6.QtStateMachine', 'PySide6.QtSvg',
+    'PySide6.QtSql', 'PySide6.QtStateMachine',
     'PySide6.QtSvgWidgets', 'PySide6.QtTest', 'PySide6.QtTextToSpeech',
     'PySide6.QtUiTools', 'PySide6.QtVirtualKeyboard', 'PySide6.QtWebChannel',
     'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineQuick',
@@ -85,7 +91,7 @@ EXCLUDED_DLLS = {
     'Qt6Qml.dll', 'Qt6QmlMeta.dll', 'Qt6QmlModels.dll',
     'Qt6QmlWorkerScript.dll', 'Qt6QmlLocalStorage.dll',
     'Qt6Pdf.dll', 'Qt6PdfQuick.dll',
-    'Qt6OpenGL.dll', 'Qt6Svg.dll',
+    'Qt6OpenGL.dll',
     'Qt6VirtualKeyboard.dll', 'Qt6LabsQmlModels.dll',
     'Qt6LabsAnimation.dll', 'Qt6LabsFolderListModel.dll',
     'Qt6LabsSettings.dll', 'Qt6LabsSharedImage.dll',
@@ -97,7 +103,7 @@ UPX_EXCLUDE = [
     'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll',
     'python3.dll', 'python313.dll', 'python312.dll', 'python311.dll',
     'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'Qt6Network.dll',
-    'Qt6DBus.dll',
+    'Qt6Svg.dll', 'Qt6DBus.dll',
     'qwindows.dll', 'qwindowsvistastyle.dll', 'qmodernwindowsstyle.dll',
     'qdirect2d.dll',
 ]
@@ -125,8 +131,10 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    # The typeface is part of the design system, so it ships with the app
+    # rather than being assumed present on the host.
+    datas=[('src/pymeasure/gui/fonts', 'pymeasure/gui/fonts')],
+    hiddenimports=['PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

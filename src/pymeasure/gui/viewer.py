@@ -6,14 +6,14 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
-from PySide6.QtCore import Qt, QPointF, QRect, QRectF, Signal
+from PySide6.QtCore import Qt, QPointF, QRect, QRectF, QSize, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QPixmap,
-    QPolygonF,
+    QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPalette, QPen,
+    QPixmap, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QMenu, QPlainTextEdit, QSizePolicy,
-    QTabBar, QWidget,
+    QTabBar, QToolButton, QWidget,
 )
 
 from ..core.constants import Tool
@@ -23,27 +23,35 @@ from .dialogs import (
     ScaleCoordsDialog, ScaleDistanceDialog, SetOriginDialog, TextBoxDialog,
 )
 from ..core.models import DiagramObject, Point, ScaleInfo
+from . import icons
+from .theme import Tokens as T
 
 _HIT_R      = 8   # hit-test radius in screen pixels
 _DRAG_THRESH = 4  # pixels before a press becomes a drag
 _MAX_UNDO   = 100 # maximum retained undo steps (per page)
 
+# Every colour here comes from theme.py. A mark is an encoded value drawn on
+# top of the user's document, so it keeps its colour - and every mark carries
+# its own drawn label, so colour is never the only thing identifying it.
 _KIND_COLOR = {
-    "point":    QColor("#4488ff"),
-    "distance": QColor("#ffdd00"),
-    "angle":    QColor("#ff8800"),
-    "polygon":  QColor("#ff6699"),
-    "polyline": QColor("#44ddaa"),
-    "ellipse":  QColor("#22bbee"),
-    "textbox":  QColor("#dddddd"),
-    "polyline_contour": QColor("#999999"),
-    "point_contour":    QColor("#999999"),
+    "point":    QColor(T.MARK_POINT),
+    "distance": QColor(T.MARK_DISTANCE),
+    "angle":    QColor(T.MARK_ANGLE),
+    "polygon":  QColor(T.MARK_POLYGON),
+    "polyline": QColor(T.MARK_POLYLINE),
+    "ellipse":  QColor(T.MARK_ELLIPSE),
+    "textbox":  QColor(T.MARK_TEXTBOX),
+    "polyline_contour": QColor(T.MARK_CONTOUR),
+    "point_contour":    QColor(T.MARK_CONTOUR),
 }
-_SEL_COLOR   = QColor("#ff2222")
-_LABEL_COLOR = QColor("#dd0000")
-_PREVIEW_COLOR = QColor("#dd0000")
-_SKELETON_COLOR = QColor("#aaaaaa")   # thin dashed defining geometry of contours
-_BBOX_COLOR  = QColor("#aaaaaa")      # thin dashed bounding box (ellipse/textbox)
+
+_SEL_COLOR      = QColor(T.MARK_SELECTED)   # the current selection
+_LABEL_COLOR    = QColor(T.MARK_TEXTBOX)    # a label with no colour of its own
+_PREVIEW_COLOR  = QColor(T.MARK_PREVIEW)    # geometry still being placed
+_HANDLE_COLOR   = QColor(T.MARK_SELECTED)   # draggable vertex handles
+_DATUM_COLOR    = QColor(T.MARK_ORIGIN)     # origin and scale references
+_SKELETON_COLOR = QColor(T.MARK_GUIDE)      # thin dashed defining geometry of contours
+_BBOX_COLOR     = QColor(T.MARK_GUIDE)      # thin dashed bounding box (ellipse/textbox)
 
 _PEN_STYLES = {
     "solid":   Qt.PenStyle.SolidLine,
@@ -307,7 +315,9 @@ class ImageViewer(QWidget):
 
         # Tab bar (positioned at top by resizeEvent)
         self._tab_bar = QTabBar(self)
+        self._tab_bar.setObjectName("documentTabs")
         self._tab_bar.setTabsClosable(True)
+        self._tab_bar.setElideMode(Qt.TextElideMode.ElideMiddle)
         self._tab_bar.setMovable(True)
         self._tab_bar.setDocumentMode(True)
         self._tab_bar.setExpanding(False)
@@ -320,6 +330,9 @@ class ImageViewer(QWidget):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # The canvas keeps a usable width however far the splitter is dragged:
+        # below this a fitted page is too small to measure on.
+        self.setMinimumSize(420, 320)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
@@ -503,6 +516,8 @@ class ImageViewer(QWidget):
         self._suppress_tab_signal = True
         self._tab_bar.addTab(self._tab_label_for(tab))
         self._tab_bar.setTabToolTip(idx, file_path or "Untitled")
+        self._tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide,
+                                   self._make_close_button())
         self._tab_bar.show()
         self._suppress_tab_signal = False
 
@@ -600,6 +615,29 @@ class ImageViewer(QWidget):
             return
         if 0 <= idx < len(self._tabs):
             self.set_current_tab(idx)
+
+    def _make_close_button(self) -> QToolButton:
+        """The tab's close control, in the app's own icon family.
+
+        Qt's built-in closable tab draws the platform style's close glyph,
+        which on Fusion is a red cross that belongs to no other part of this
+        app. The button is looked up by identity when clicked, because a tab's
+        index changes as tabs are closed and dragged.
+        """
+        button = QToolButton(self._tab_bar)
+        button.setIcon(icons.icon("close"))
+        button.setIconSize(QSize(T.ICON_SIZE, T.ICON_SIZE))
+        button.setAutoRaise(True)
+        button.setToolTip("Close this document")
+        button.clicked.connect(lambda: self._close_button_clicked(button))
+        return button
+
+    def _close_button_clicked(self, button: QToolButton):
+        for i in range(self._tab_bar.count()):
+            if self._tab_bar.tabButton(
+                    i, QTabBar.ButtonPosition.RightSide) is button:
+                self._on_tab_bar_close_requested(i)
+                return
 
     def _on_tab_bar_close_requested(self, idx: int):
         # MainWindow decides whether to close (with confirmation if needed).
@@ -896,12 +934,19 @@ class ImageViewer(QWidget):
 
         top = self._canvas_top()
         canvas_rect = QRectF(0, top, self.width(), max(0, self.height() - top))
-        painter.fillRect(canvas_rect, QColor("#2b2b2b"))
+        # The document sits on a mat, so the edge of the page stays visible
+        # even when the page itself is white.
+        painter.fillRect(canvas_rect, QColor(T.mat()))
 
         if self._pixmap is None:
-            painter.setPen(QColor("#888888"))
-            msg = ("Welcome to PyMeasure!\nOpen an image or PDF to get started"
-                   if self._active is None else "Loading…")
+            # Not a blank rectangle: one tertiary line saying what appears
+            # here and which action fills it.
+            painter.setPen(QColor(T.ink_hex(T.INK_TERTIARY)))
+            if self._active is None:
+                msg = ("No document open\n"
+                       "Open an image or PDF (Ctrl+O) to start measuring")
+            else:
+                msg = "Loading…"
             painter.drawText(canvas_rect, Qt.AlignmentFlag.AlignCenter, msg)
             return
 
@@ -931,7 +976,7 @@ class ImageViewer(QWidget):
 
     def _paint_origin(self, painter: QPainter):
         sp = self._img_to_screen(QPointF(self.origin.x, self.origin.y))
-        painter.setPen(QPen(QColor("#ff4444"), 2))
+        painter.setPen(QPen(_DATUM_COLOR, 2))
         x, y = int(sp.x()), int(sp.y())
         painter.drawLine(x - 12, y, x + 12, y)
         painter.drawLine(x, y - 12, x, y + 12)
@@ -940,7 +985,7 @@ class ImageViewer(QWidget):
         """Stroke pen for a line-based object, honoring its color, line width,
         and line style (selection overrides the color)."""
         color = _SEL_COLOR if selected else (
-            QColor(obj.color) if obj.color else _KIND_COLOR.get(obj.kind, QColor("white"))
+            QColor(obj.color) if obj.color else _KIND_COLOR.get(obj.kind, _LABEL_COLOR)
         )
         width = obj.line_width if obj.line_width and obj.line_width > 0 else 2.0
         pen = QPen(color, width)
@@ -1116,7 +1161,7 @@ class ImageViewer(QWidget):
             font.setItalic(obj.italic)
             font.setUnderline(obj.underline)
             painter.setFont(font)
-            painter.setPen(QColor(obj.font_color) if obj.font_color else QColor("#ffffff"))
+            painter.setPen(QColor(obj.font_color) if obj.font_color else QColor(T.MARK_TEXTBOX))
             align = (_H_ALIGN.get(obj.h_align, Qt.AlignmentFlag.AlignLeft)
                      | _V_ALIGN.get(obj.v_align, Qt.AlignmentFlag.AlignTop))
             painter.drawText(rect.adjusted(4, 2, -4, -2),
@@ -1149,8 +1194,8 @@ class ImageViewer(QWidget):
             painter.drawText(QPointF(sps[0].x() + 7, sps[0].y() - 6), obj.name)
 
     def _paint_vertex_handles(self, painter: QPainter, points: list):
-        painter.setPen(QPen(QColor("#00ff88"), 1))
-        painter.setBrush(QBrush(QColor("#00ff88")))
+        painter.setPen(QPen(_HANDLE_COLOR, 1))
+        painter.setBrush(QBrush(_HANDLE_COLOR))
         for px, py in points:
             sp = self._img_to_screen(QPointF(px, py))
             painter.drawEllipse(sp, 6.0, 6.0)
@@ -1162,7 +1207,7 @@ class ImageViewer(QWidget):
         pts_screen = [self._img_to_screen(QPointF(p.x, p.y)) for p in self._temp]
 
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor("#00cc66")))
+        painter.setBrush(QBrush(_PREVIEW_COLOR))
         for sp in pts_screen:
             painter.drawEllipse(sp, 5.0, 5.0)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1176,42 +1221,42 @@ class ImageViewer(QWidget):
                 painter.drawLine(pts_screen[0], preview)
 
         elif tool == Tool.ADD_ANGLE:
-            painter.setPen(QPen(QColor("#ff8800"), 2))
+            painter.setPen(QPen(_KIND_COLOR["angle"], 2))
             for i in range(len(pts_screen) - 1):
                 painter.drawLine(pts_screen[i], pts_screen[i + 1])
             if preview:
-                painter.setPen(QPen(QColor("#ff8800"), 1, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(_KIND_COLOR["angle"], 1, Qt.PenStyle.DashLine))
                 painter.drawLine(pts_screen[-1], preview)
 
         elif tool in (Tool.SET_SCALE_DISTANCE, Tool.SET_SCALE_COORDS):
             if len(pts_screen) == 2:
-                painter.setPen(QPen(QColor("#cc66ff"), 2, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(_DATUM_COLOR, 2, Qt.PenStyle.DashLine))
                 painter.drawLine(pts_screen[0], pts_screen[1])
             elif len(pts_screen) == 1 and preview:
-                painter.setPen(QPen(QColor("#cc66ff"), 1, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(_DATUM_COLOR, 1, Qt.PenStyle.DashLine))
                 painter.drawLine(pts_screen[0], preview)
 
         elif tool == Tool.ADD_POLYGON:
             all_pts = pts_screen + ([preview] if preview else [])
-            painter.setPen(QPen(QColor("#ff6699"), 2))
-            fill = QColor("#ff6699")
+            painter.setPen(QPen(_KIND_COLOR["polygon"], 2))
+            fill = QColor(_KIND_COLOR["polygon"])
             fill.setAlpha(30)
             painter.setBrush(QBrush(fill))
             if len(all_pts) >= 2:
                 painter.drawPolygon(QPolygonF(all_pts))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QColor("white"))
+            painter.setPen(_KIND_COLOR["polygon"])
             for i, sp in enumerate(pts_screen):
                 painter.drawText(QPointF(sp.x() + 7, sp.y() - 4), str(i + 1))
 
         elif tool in (Tool.ADD_POLYLINE, Tool.ADD_POLYLINE_CONTOUR):
-            painter.setPen(QPen(QColor("#44ddaa"), 2))
+            painter.setPen(QPen(_KIND_COLOR["polyline"], 2))
             for i in range(len(pts_screen) - 1):
                 painter.drawLine(pts_screen[i], pts_screen[i + 1])
             if preview and pts_screen:
                 painter.setPen(QPen(_PREVIEW_COLOR, 1, Qt.PenStyle.DashLine))
                 painter.drawLine(pts_screen[-1], preview)
-            painter.setPen(QColor("white"))
+            painter.setPen(_KIND_COLOR["polyline"])
             for i, sp in enumerate(pts_screen):
                 painter.drawText(QPointF(sp.x() + 7, sp.y() - 4), str(i + 1))
 
@@ -1233,8 +1278,8 @@ class ImageViewer(QWidget):
         s0 = self._zoom_rect_start
         s1 = self._img_to_screen(self._mouse_img)
         rect = QRectF(s0, s1).normalized()
-        painter.setPen(QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine))
-        fill = QColor("#ffffff")
+        painter.setPen(QPen(_PREVIEW_COLOR, 1, Qt.PenStyle.DashLine))
+        fill = QColor(_PREVIEW_COLOR)
         fill.setAlpha(20)
         painter.setBrush(QBrush(fill))
         painter.drawRect(rect)
@@ -1248,8 +1293,8 @@ class ImageViewer(QWidget):
         s0 = self._box_sel_start
         s1 = self._img_to_screen(self._mouse_img)
         rect = QRectF(s0, s1).normalized()
-        painter.setPen(QPen(QColor("#ff2222"), 1, Qt.PenStyle.DashLine))
-        fill = QColor("#ff2222")
+        painter.setPen(QPen(_SEL_COLOR, 1, Qt.PenStyle.DashLine))
+        fill = QColor(_SEL_COLOR)
         fill.setAlpha(35)
         painter.setBrush(QBrush(fill))
         painter.drawRect(rect)
@@ -1281,7 +1326,8 @@ class ImageViewer(QWidget):
         if sig != self._contour_cache_sig:
             contour_objs = [o for o in self.objects if o.is_contour]
             self._contour_cache = contours.build_contour_groups(
-                contour_objs, self.scale_info.scale_factor
+                contour_objs, self.scale_info.scale_factor,
+                default_color=T.contour(0),
             )
             self._contour_cache_sig = sig
         return self._contour_cache
@@ -1334,16 +1380,19 @@ class ImageViewer(QWidget):
         rect = QRectF(x, y, box_w, box_h)
         self._legend_rect = rect
 
-        bg = QColor("#ffffff")
-        bg.setAlpha(225)
-        painter.setPen(QPen(QColor("#333333"), 1))
+        # The legend is app chrome sitting over the document, so it takes the
+        # canvas and the ink ladder rather than a colour of its own. Only the
+        # swatches carry colour - they are the data.
+        bg = QColor(T.CANVAS)
+        bg.setAlpha(235)
+        painter.setPen(QPen(QColor(T.ink_hex(T.SURFACE_BORDER_STRONG)), 1))
         painter.setBrush(QBrush(bg))
         painter.drawRect(rect)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         content_x = x + pad
         painter.setFont(title_font)
-        painter.setPen(QColor("#000000"))
+        painter.setPen(QColor(T.INK))
         painter.drawText(QPointF(content_x, y + pad + tfm.ascent()), title)
 
         painter.setFont(base_font)
@@ -1356,7 +1405,7 @@ class ImageViewer(QWidget):
             sw_y = line_top + fm.height() / 2.0
             painter.drawLine(QPointF(content_x, sw_y),
                              QPointF(content_x + swatch_w, sw_y))
-            painter.setPen(QColor("#000000"))
+            painter.setPen(QColor(T.INK))
             painter.drawText(QPointF(content_x + swatch_w + gap, line_top + fm.ascent()),
                              g["reference"])
         painter.restore()
@@ -2219,12 +2268,15 @@ class ImageViewer(QWidget):
         font.setItalic(obj.italic)
         font.setUnderline(obj.underline)
         ed.setFont(font)
-        fg = obj.font_color or "#ffffff"
-        bg = obj.fill_color or "#3a3a3a"
-        ed.setStyleSheet(
-            f"QPlainTextEdit {{ color: {fg}; background-color: {bg}; "
-            "border: 1px solid #ff2222; }"
-        )
+        # The editor shows the box's own colours, so what is typed looks like
+        # what will be drawn. Set through the palette rather than a stylesheet:
+        # theme.py is the only place in the app that calls setStyleSheet.
+        palette = ed.palette()
+        palette.setColor(QPalette.ColorRole.Text,
+                         QColor(obj.font_color or T.MARK_TEXTBOX))
+        palette.setColor(QPalette.ColorRole.Base,
+                         QColor(obj.fill_color or T.CANVAS))
+        ed.setPalette(palette)
         ed.setGeometry(rect)
         ed.committed.connect(self._apply_inline_text)
         ed.cancelled.connect(self._close_inline_editor)
@@ -2567,7 +2619,7 @@ class ImageViewer(QWidget):
         return f"{prefix}{count}"
 
     def _ask_name_and_color(self, kind: str) -> Optional[Tuple[str, str, float, str]]:
-        default_color = _KIND_COLOR.get(kind, QColor("#ffffff")).name()
+        default_color = _KIND_COLOR.get(kind, _LABEL_COLOR).name()
         dlg = NameDialog(kind, self._default_object_name(kind), default_color, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self._temp.clear()
